@@ -23,6 +23,8 @@ jobs:
           distribution: temurin
           java-version: "25"
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Configure Android SDK
         run: sdkmanager "platforms;android-37" "build-tools;37.0.0"
       - name: Decode release keystore
