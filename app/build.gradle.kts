@@ -1,7 +1,7 @@
 plugins { id("com.android.application") }
 android {
     namespace = "app.morphe.jam.companion"
-    compileSdk = 37
+    compileSdk = 36
     defaultConfig { applicationId = "app.morphe.jam.companion"; minSdk = 26; targetSdk = 37; versionCode = 1; versionName = "1.0.0"; testInstrumentationRunner = "app.morphe.jam.companion.DeviceScenario" }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_11; targetCompatibility = JavaVersion.VERSION_11 }
     signingConfigs {

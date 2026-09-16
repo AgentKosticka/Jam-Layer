@@ -26,7 +26,7 @@ jobs:
         with:
           packages: platform-tools
       - name: Configure Android SDK
-        run: sdkmanager "platforms;android-37" "build-tools;37.0.0"
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
       - name: Decode release keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.JAM_KEYSTORE_BASE64 }}
