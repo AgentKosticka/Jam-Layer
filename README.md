@@ -2,7 +2,7 @@
 
 Jam Layer provides pairing, nearby discovery, encrypted transport and session lifetime for native YouTube Music queue sharing. Host and guest devices keep using YouTube Music's own queue; Jam Layer does not stream audio.
 
-The matching optional YouTube Music patch targets **9.15.51**. The patch is available in [the Jam queue sharing patch source](https://github.com/AgentKosticka/Jam-Patches). The upstream contribution is tracked in [Morphe patches](https://github.com/AgentKosticka/morphe-patches/pull/1) once opened.
+The matching optional YouTube Music patch targets **9.15.51**. The patch is available in [the Jam queue sharing patch source](https://github.com/AgentKosticka/Jam-Patches/releases). The upstream contribution is tracked in [Morphe patches](https://github.com/MorpheApp/morphe-patches/pull/3014) once opened.
 
 ## Install
 
@@ -17,3 +17,4 @@ The release signer certificate SHA-256 is pinned in the companion and matching M
 ## Scope and security
 
 This is an experimental development project for YouTube Music 9.15.51 and Android API 26+. Invitations are bearer credentials. The transport authenticates and encrypts session traffic. The implementation has not received an independent security audit.
+
