@@ -1,0 +1,27 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+    <uses-feature android:name="android.hardware.wifi.aware" android:required="false"/>
+    <queries>
+        <package android:name="app.morphe.android.apps.youtube.music"/>
+        <package android:name="com.google.android.apps.youtube.music"/>
+    </queries>
+    <application android:label="Jam Layer" android:icon="@mipmap/ic_jam" android:roundIcon="@mipmap/ic_jam" android:theme="@android:style/Theme.Material.NoActionBar" android:allowBackup="false" android:usesCleartextTraffic="false">
+        <!-- Opened explicitly by YTM for permissions, pairing and scanning. -->
+        <activity android:name=".MainActivity" android:exported="true" android:excludeFromRecents="true"/>
+        <activity android:name=".ScanActivity" android:exported="false"/>
+        <service android:name=".JamService" android:exported="true" android:foregroundServiceType="connectedDevice"/>
+    </application>
+</manifest>
