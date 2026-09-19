@@ -40,7 +40,7 @@ public final class JamService extends Service {
     public static Intent startIntent(Context c){return new Intent(c,JamService.class).putExtra("cap",c.getSharedPreferences("pair",0).getString("cap",""));}
     private final IJamCompanion.Stub binder=new IJamCompanion.Stub(){
         public String call(String capability,String request){
-            Trust.caller(JamService.this,prefs().getString("package",""),prefs().getString("cert",""));
+            Trust.caller(JamService.this,prefs().getString("package", ""));
             Trust.capability(prefs().getString("cap",null),capability);
             if(request==null||request.length()>32768)throw new IllegalArgumentException("Request size");
             try{return dispatch(new JSONObject(request)).toString();}catch(Exception e){return error(e.getMessage()).toString();}
@@ -54,40 +54,51 @@ public final class JamService extends Service {
             Invitation i=invitation;if(i==null)return;
             if(!i.valid()){end();message="Session expired";return;}
             try{
-                if("Host".equals(role)){synchronized(serial){if(invitation!=i)return;JSONObject value=music(new JSONObject().put("op","SNAPSHOT"));sharedQueue=value;}}
-                else if(channel!=null){dispatch(new JSONObject().put("op","SYNC").put("revision",sharedQueue==null?"":sharedQueue.optString("revision")));}
+                if("Host".equals(role)){synchronized(serial){if(invitation!=i)return;snapshotHost(i);}}
+                else if(channel!=null){sync(i);}
                 else if(System.currentTimeMillis()-discoveryStarted>15000){discoveryStarted=System.currentTimeMillis();reconnect(i);}
             }catch(Exception ignored){}
-        },1,1,TimeUnit.SECONDS);
+        },500,500,TimeUnit.MILLISECONDS);
     }
     public void bindMusic(){
         if(bound)return;String pkg=prefs().getString("package","");if(pkg.isEmpty())return;
-        try{if(!Trust.equal(prefs().getString("cert",""),Trust.certificate(this,pkg)))throw new SecurityException("YTM signer changed");
-            bound=bindService(new Intent().setComponent(new ComponentName(pkg,Trust.BRIDGE_SERVICE)),binding,BIND_AUTO_CREATE);
+        try{bound=bindService(new Intent().setComponent(new ComponentName(pkg,Trust.BRIDGE_SERVICE)),binding,BIND_AUTO_CREATE);
         }catch(Exception e){message="Pair YouTube Music again";}
+    }
+    public void rebindMusic(){
+        if(bound){try{unbindService(binding);}catch(Exception ignored){}bound=false;}
+        bridge=null;bindMusic();
     }
     @Override public IBinder onBind(Intent i){return binder;}
     @Override public int onStartCommand(Intent i,int flags,int id){
-        try{Trust.capability(prefs().getString("cap",null),i==null?null:i.getStringExtra("cap"));}catch(SecurityException denied){if(invitation==null)stopSelf(id);return START_NOT_STICKY;}
         NotificationManager nm=getSystemService(NotificationManager.class);nm.createNotificationChannel(new NotificationChannel("jam","Jam session",NotificationManager.IMPORTANCE_LOW));
         Intent player=getPackageManager().getLaunchIntentForPackage(getSharedPreferences("pair",0).getString("package","app.morphe.jam.probe.music"));
         Notification.Builder notification=new Notification.Builder(this,"jam").setSmallIcon(R.drawable.ic_jam_notification).setContentTitle("Jam Layer").setContentText("Manage your Jam in YouTube Music");
         if(player!=null)notification.setContentIntent(PendingIntent.getActivity(this,0,player,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT));
         startForeground(41,notification.build());
+        try{Trust.capability(prefs().getString("cap",null),i==null?null:i.getStringExtra("cap"));}catch(SecurityException denied){if(invitation==null)stopSelf(id);return START_NOT_STICKY;}
         bindMusic();return START_NOT_STICKY;
     }
     public JSONObject state(){try{return ok().put("role",role).put("transport",transport).put("message",message).put("paired",bridge!=null).put("peers",sockets.size()).put("allowGuestEdits",allowGuestEdits);}catch(Exception e){return error("State unavailable");}}
     public String invite(){Invitation i=invitation;return i!=null && "Host".equals(role)?i.uri():"";}
     public JSONObject joinCode(String code,String mode)throws Exception{
-        CodeExchange.normalize(code);end();long epoch=sessionEpoch;role="Joining";message="Finding the code on this Wi-Fi…";
+        CodeExchange.normalize(code);end();long epoch=sessionEpoch;role="Joining";message="Finding the code on nearby devices…";
         try{String value=CodePairing.find(this,code);if(epoch!=sessionEpoch)return error("Joining cancelled");join(value,mode);return ok();}
         catch(Exception e){if(epoch==sessionEpoch){role="Idle";message=e.getMessage();}throw e;}
     }
-    public void host(String mode){workers.execute(()->{try{end();Invitation next=new Invitation();invitation=next;role="Host";selectedMode=mode;wakeLock.acquire(12*60*60*1000L);server=new ServerSocket(0);ServerSocket listening=server;
-        nearby=new Nearby(this,next,true,listening.getLocalPort(),mode,listener);nearby.start();message="Host ready; share the QR invitation";
-        while(invitation==next && next.valid()) {Socket socket=listening.accept();if(sockets.size()>=8){socket.close();continue;}sockets.add(socket);workers.execute(()->serve(socket,next));}
-    }catch(Exception e){android.util.Log.e("MorpheJam","Host failed",e);if(invitation!=null)message="Host stopped: "+e.getClass().getSimpleName();}});}
-    public void join(String value,String mode){final Invitation next=new Invitation(value);workers.execute(()->{end();invitation=next;role="Participant";selectedMode=mode;wakeLock.acquire(Math.max(1,next.expires-System.currentTimeMillis()));message="Discovering host";discoveryStarted=System.currentTimeMillis();nearby=new Nearby(this,next,false,0,mode,listener);nearby.start();});}
+    public void host(String mode){
+        end();Invitation next=new Invitation();invitation=next;role="Host";selectedMode=mode;transport="Starting";message="Starting host";
+        wakeLock.acquire(12*60*60*1000L);
+        workers.execute(()->{try{ServerSocket listening=new ServerSocket(0);if(invitation!=next||!next.valid()){listening.close();return;}server=listening;
+            nearby=new Nearby(this,next,true,listening.getLocalPort(),mode,listener);nearby.start();message="Host ready; share the QR invitation";
+            synchronized(serial){snapshotHost(next);}
+            while(invitation==next && next.valid()) {Socket socket=listening.accept();if(sockets.size()>=8){socket.close();continue;}sockets.add(socket);workers.execute(()->serve(socket,next));}
+        }catch(Exception e){if(invitation==next){android.util.Log.e("MorpheJam","Host failed",e);message="Host stopped: "+e.getClass().getSimpleName();}}});
+    }
+    public void join(String value,String mode){
+        final Invitation next=new Invitation(value);end();invitation=next;role="Participant";selectedMode=mode;transport="Connecting";
+        wakeLock.acquire(Math.max(1,next.expires-System.currentTimeMillis()));message="Discovering host";discoveryStarted=System.currentTimeMillis();nearby=new Nearby(this,next,false,0,mode,listener);nearby.start();
+    }
     private void reconnect(Invitation expected){
         monitor.schedule(()->{if(invitation!=expected||channel!=null)return;
             if(nearby!=null)nearby.close();nearby=new Nearby(this,expected,false,0,selectedMode,listener);nearby.start();
@@ -96,11 +107,13 @@ public final class JamService extends Service {
     private final Nearby.Listener listener=new Nearby.Listener(){
         public void status(String m){message=m;android.util.Log.i("MorpheJam",m);}
         public void connect(Socket socket,String selected){
+            Invitation connected;
             synchronized(connectionLock){
                 Invitation i=invitation;if(i==null||!i.valid()||!"Participant".equals(role)||channel!=null){try{socket.close();}catch(Exception ignored){}return;}
-                try{SecureChannel candidate=new SecureChannel(socket,false,i.jamId,i.secret,identity);channel=candidate;sockets.add(socket);transport=selected;message="Authenticated host connected";android.util.Log.i("MorpheJam","Authenticated transport="+selected);}
+                try{SecureChannel candidate=new SecureChannel(socket,false,i.jamId,i.secret,identity);channel=candidate;sockets.add(socket);transport=selected;message="Authenticated host connected";connected=i;android.util.Log.i("MorpheJam","Authenticated transport="+selected);}
                 catch(Exception e){try{socket.close();}catch(Exception ignored){}message="Host authentication failed";reconnect(i);}
             }
+            if(channel!=null){Invitation expected=invitation;workers.execute(()->sync(expected));}
         }
     };
     private void serve(Socket socket,Invitation session){
@@ -114,7 +127,7 @@ public final class JamService extends Service {
                     String reply;
                     synchronized(serial){
                         JSONObject value=sharedQueue;
-                        if(value==null)value=music(new JSONObject().put("op","SNAPSHOT"));
+                        if(value==null)value=snapshotHost(session);
                         value=new JSONObject(value.toString());
                         JSONObject clock=value.optJSONObject("clock");
                         if(clock!=null)clock.put("age",Math.max(0,SystemClock.elapsedRealtime()-clock.optLong("sampledAt",SystemClock.elapsedRealtime())));
@@ -129,7 +142,7 @@ public final class JamService extends Service {
     }
     private JSONObject hostCall(JSONObject request,String client)throws Exception{
         synchronized(serial){
-            String op=request.optString("op");if("SNAPSHOT".equals(op))return music(request);
+            String op=request.optString("op");if("SNAPSHOT".equals(op))return snapshotHost(invitation);
             if(!identity.equals(client)&&!allowGuestEdits)return error("The host has locked guest edits");
             String id=request.getString("id");if(!UUID.fromString(id).toString().equals(id))return error("Invalid command id");
             String key=client+":"+id,body=request.toString();
@@ -145,6 +158,26 @@ public final class JamService extends Service {
         IJamBridge b=bridge;if(b==null)return error("Host YouTube Music is not connected; start a song");
         return new JSONObject(b.call(prefs().getString("cap",""),request.toString()));
     }
+    private JSONObject snapshotHost(Invitation expected){
+        try{
+            JSONObject value=music(new JSONObject().put("op","SNAPSHOT"));
+            if(value.optBoolean("ok")&&value.has("items")){sharedQueue=value;return value;}
+            String failure=value.optString("error","Host queue is unavailable");
+            if(invitation==expected&&!failure.equals(message)){message=failure;android.util.Log.w("MorpheJam","Host snapshot: "+failure);}
+            return value;
+        }catch(Exception e){
+            String failure="Host queue unavailable: "+e.getClass().getSimpleName();
+            if(invitation==expected&&!failure.equals(message)){message=failure;android.util.Log.w("MorpheJam",failure,e);}
+            return error(failure);
+        }
+    }
+    private void sync(Invitation expected){
+        if(invitation!=expected||channel==null)return;
+        try{
+            JSONObject value=dispatch(new JSONObject().put("op","SYNC").put("revision",sharedQueue==null?"":sharedQueue.optString("revision")));
+            if(!value.optBoolean("ok")&&!value.optBoolean("unchanged")){String failure=value.optString("error");if(!failure.isEmpty())message=failure;}
+        }catch(Exception e){android.util.Log.w("MorpheJam","Host sync failed",e);}
+    }
     public JSONObject dispatch(JSONObject request)throws Exception{
         if("STATE".equals(request.optString("op")))return state();
         if("HOST".equals(request.optString("op"))){host(request.optString("transport","Auto"));return ok();}
@@ -156,10 +189,13 @@ public final class JamService extends Service {
             for(int y=0;y<600;y++)for(int x=0;x<600;x++)bitmap.setPixel(x,y,bits.get(x,y)?0xff000000:0xffffffff);
             java.io.ByteArrayOutputStream bytes=new java.io.ByteArrayOutputStream();bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG,100,bytes);bitmap.recycle();
             JSONObject reply=ok().put("invite",value).put("qr",android.util.Base64.encodeToString(bytes.toByteArray(),android.util.Base64.NO_WRAP));
-            synchronized(serial){try{if(codePairing==null||!codePairing.valid()){if(codePairing!=null)codePairing.close();codePairing=new CodePairing(this,invitation);}reply.put("code",codePairing.display()).put("codeExpires",codePairing.expires());}catch(Exception e){reply.put("codeError","Short codes need local Wi-Fi access. QR invitations remain available.");}}
+            synchronized(serial){try{if(codePairing==null||!codePairing.valid()){if(codePairing!=null)codePairing.close();codePairing=new CodePairing(this,invitation);}reply.put("code",codePairing.display()).put("codeExpires",codePairing.expires());}catch(Exception e){reply.put("codeError","Short code sharing is unavailable. QR invitations remain available.");}}
             return reply;
         }
-        if("VIEW".equals(request.optString("op"))){JSONObject view=sharedQueue==null?error("Waiting for the host queue"):new JSONObject(sharedQueue.toString());return view.put("session",state());}
+        if("VIEW".equals(request.optString("op"))){
+            JSONObject view=sharedQueue==null?error("Participant".equals(role)&&!"Authenticated host connected".equals(message)?message:"Waiting for the host queue"):new JSONObject(sharedQueue.toString());
+            return view.put("session",state());
+        }
         if("GUEST_EDITS".equals(request.optString("op"))){if(!"Host".equals(role))return error("Only the host can change permissions");allowGuestEdits=request.getBoolean("allow");return ok();}
         if("END".equals(request.optString("op"))){end();return ok();}
         Invitation current=invitation;if(current==null||!current.valid())return error("No active Jam session");
@@ -167,7 +203,7 @@ public final class JamService extends Service {
         synchronized(connectionLock){
             if(channel==null)return error("Host is not connected");
             try{long sent=SystemClock.elapsedRealtime();channel.send(request.toString());JSONObject value=new JSONObject(channel.receive());JSONObject clock=value.optJSONObject("clock");if(clock!=null)clock.put("receivedAt",SystemClock.elapsedRealtime()).put("age",Math.min(4000,clock.optLong("age")+(SystemClock.elapsedRealtime()-sent)/2));if(value.optBoolean("ok")&&value.has("items"))sharedQueue=value;else if(value.optBoolean("unchanged")&&value.has("clock")&&sharedQueue!=null){JSONObject copy=new JSONObject(sharedQueue.toString());copy.put("clock",value.getJSONObject("clock"));sharedQueue=copy;}return value;}
-            catch(Exception e){try{channel.close();}catch(Exception ignored){}channel=null;sockets.removeIf(Socket::isClosed);transport="Disconnected";message="Reconnecting to host";reconnect(current);return error("Outcome unknown; refresh before editing. Reconnecting.");}
+            catch(Exception e){android.util.Log.w("MorpheJam","Host channel failed",e);try{channel.close();}catch(Exception ignored){}channel=null;sockets.removeIf(Socket::isClosed);transport="Disconnected";message="Reconnecting to host";reconnect(current);return error("Outcome unknown; refresh before editing. Reconnecting.");}
         }
     }
     public void end(){

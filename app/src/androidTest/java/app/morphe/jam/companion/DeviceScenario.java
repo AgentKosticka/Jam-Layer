@@ -4,6 +4,7 @@ import android.content.*;
 import android.os.*;
 import org.json.*;
 import java.nio.file.*;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /** Installed only in the separate test APK. No diagnostic entry point in shipped app. */
@@ -17,6 +18,8 @@ public final class DeviceScenario extends Instrumentation {
         return result;
     }
     private static JSONObject command(String op)throws Exception{return new JSONObject().put("op",op).put("id",UUID.randomUUID().toString());}
+    private static String read(Path path)throws Exception{return new String(Files.readAllBytes(path),StandardCharsets.UTF_8);}
+    private static void write(Path path,String value)throws Exception{Files.write(path,value.getBytes(StandardCharsets.UTF_8));}
     @Override public void onStart(){
         Bundle result=new Bundle();
         try{
@@ -27,14 +30,14 @@ public final class DeviceScenario extends Instrumentation {
             if("host".equals(args.getString("role"))){
                 s.host(mode);for(int i=0;i<50&&s.invite().isEmpty();i++)Thread.sleep(100);
                 check(!s.invite().isEmpty(),"Host not ready");
-                Files.writeString(context.getFilesDir().toPath().resolve("test-invite.txt"),s.invite());
+                write(context.getFilesDir().toPath().resolve("test-invite.txt"),s.invite());
                 JSONObject invitation=s.dispatch(new JSONObject().put("op","INVITE"));
-                Files.writeString(context.getFilesDir().toPath().resolve("test-code.txt"),invitation.getString("code"));
-                note("HOST_READY "+mode);
-                Thread.sleep(3600000);
+                 write(context.getFilesDir().toPath().resolve("test-code.txt"),invitation.getString("code"));
+                 note("HOST_READY "+mode);
+                finish(Activity.RESULT_OK,result);return;
             }else{
-                if("code".equals(args.getString("join"))){String code=Files.readString(context.getFilesDir().toPath().resolve("test-code.txt"));check(s.dispatch(new JSONObject().put("op","JOIN").put("invite",code).put("transport",mode)).optBoolean("ok"),"Code join failed");}
-                else {String invite=Files.readString(context.getFilesDir().toPath().resolve("test-invite.txt"));s.join(invite,mode);}
+                if("code".equals(args.getString("join"))){String code=read(context.getFilesDir().toPath().resolve("test-code.txt"));check(s.dispatch(new JSONObject().put("op","JOIN").put("invite",code).put("transport",mode)).optBoolean("ok"),"Code join failed");}
+                else {String invite=read(context.getFilesDir().toPath().resolve("test-invite.txt"));s.join(invite,mode);}
                 for(int i=0;i<300&&"None".equals(s.state().optString("transport"));i++)Thread.sleep(100);
                 note("STATE "+s.state());check(mode.equals(s.state().optString("transport"))||("Auto".equals(mode)&&Arrays.asList("LAN","Aware").contains(s.state().optString("transport"))),"Requested transport not connected");
                 if("recovery".equals(args.getString("role"))){
@@ -53,8 +56,8 @@ public final class DeviceScenario extends Instrumentation {
                     note("INTERACTIVE_READY");
                     for(int i=0;i<1800;i++){
                         Path input=context.getFilesDir().toPath().resolve("test-command.json");
-                        if(Files.exists(input)){String body=Files.readString(input);Files.delete(input);JSONObject response=s.dispatch(new JSONObject(body));Files.writeString(context.getFilesDir().toPath().resolve("test-response.json"),response.toString());}
-                        JSONObject view=s.dispatch(new JSONObject().put("op","VIEW"));Files.writeString(context.getFilesDir().toPath().resolve("test-view.json"),view.toString());Thread.sleep(2000);}
+                        if(Files.exists(input)){String body=read(input);Files.delete(input);JSONObject response=s.dispatch(new JSONObject(body));write(context.getFilesDir().toPath().resolve("test-response.json"),response.toString());}
+                        JSONObject view=s.dispatch(new JSONObject().put("op","VIEW"));write(context.getFilesDir().toPath().resolve("test-view.json"),view.toString());Thread.sleep(2000);}
                     finish(Activity.RESULT_OK,result);return;
                 }
                 JSONObject initial=request(s,new JSONObject().put("op","SNAPSHOT"));check(initial.optBoolean("ok"),initial.toString());
