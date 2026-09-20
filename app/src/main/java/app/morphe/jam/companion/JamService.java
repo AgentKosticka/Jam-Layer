@@ -40,10 +40,10 @@ public final class JamService extends Service {
     public static Intent startIntent(Context c){return new Intent(c,JamService.class).putExtra("cap",c.getSharedPreferences("pair",0).getString("cap",""));}
     private final IJamCompanion.Stub binder=new IJamCompanion.Stub(){
         public String call(String capability,String request){
-            Trust.caller(JamService.this,prefs().getString("package", ""));
+            Trust.caller(JamService.this,prefs().getString("package", ""),prefs().getString("cert", ""));
             Trust.capability(prefs().getString("cap",null),capability);
             if(request==null||request.length()>32768)throw new IllegalArgumentException("Request size");
-            try{return dispatch(new JSONObject(request)).toString();}catch(Exception e){return error(e.getMessage()).toString();}
+            try{return BridgeProtocol.advertise(dispatch(BridgeProtocol.validate(new JSONObject(request)))).toString();}catch(Exception e){return error(e.getMessage()).toString();}
         }
     };
     public static JSONObject error(String message){JSONObject r=new JSONObject();try{r.put("ok",false).put("error",message==null?"Operation failed":message);}catch(JSONException ignored){}return r;}
@@ -156,7 +156,9 @@ public final class JamService extends Service {
     }
     private JSONObject music(JSONObject request)throws Exception{
         IJamBridge b=bridge;if(b==null)return error("Host YouTube Music is not connected; start a song");
-        return new JSONObject(b.call(prefs().getString("cap",""),request.toString()));
+        if(!Trust.equal(prefs().getString("cert",""),Trust.certificate(this,prefs().getString("package",""))))
+            return error("YouTube Music signer changed; pair again");
+        return BridgeProtocol.validate(new JSONObject(b.call(prefs().getString("cap",""),BridgeProtocol.advertise(new JSONObject(request.toString())).toString())));
     }
     private JSONObject snapshotHost(Invitation expected){
         try{
@@ -179,6 +181,7 @@ public final class JamService extends Service {
         }catch(Exception e){android.util.Log.w("MorpheJam","Host sync failed",e);}
     }
     public JSONObject dispatch(JSONObject request)throws Exception{
+        if("HELLO".equals(request.optString("op")))return ok();
         if("STATE".equals(request.optString("op")))return state();
         if("HOST".equals(request.optString("op"))){host(request.optString("transport","Auto"));return ok();}
         if("JOIN".equals(request.optString("op"))){String value=request.getString("invite").trim();if(!value.startsWith("morphejam://"))return joinCode(value,request.optString("transport","Auto"));join(value,request.optString("transport","Auto"));return ok();}

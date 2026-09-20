@@ -6,6 +6,8 @@ import org.json.*;
 import java.nio.file.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import app.morphe.jam.ipc.BridgeProtocol;
+import app.morphe.jam.ipc.IJamBridge;
 
 /** Installed only in the separate test APK. No diagnostic entry point in shipped app. */
 public final class DeviceScenario extends Instrumentation {
@@ -27,18 +29,37 @@ public final class DeviceScenario extends Instrumentation {
             Thread.sleep(1200);context.startForegroundService(JamService.startIntent(context));
             for(int i=0;i<50&&JamService.active==null;i++)Thread.sleep(100);
             JamService s=JamService.active;check(s!=null,"Service unavailable");String mode=args.getString("transport","LAN");
+            if("bridge".equals(args.getString("role"))){
+                java.lang.reflect.Field field=JamService.class.getDeclaredField("bridge");field.setAccessible(true);
+                for(int i=0;i<50&&field.get(s)==null;i++)Thread.sleep(100);
+                IJamBridge bridge=(IJamBridge)field.get(s);check(bridge!=null,"Bridge not bound");
+                String cap=context.getSharedPreferences("pair",0).getString("cap","");
+                JSONObject hello=BridgeProtocol.advertise(new JSONObject().put("op","HELLO"));
+                JSONObject response=BridgeProtocol.validate(new JSONObject(bridge.call(cap,hello.toString())));
+                check(response.optBoolean("ok")&&response.has("bridgeProtocol"),"Capability negotiation failed");
+                hello.getJSONObject("bridgeProtocol").put("version",2).put("minimumVersion",2);
+                check(!new JSONObject(bridge.call(cap,hello.toString())).optBoolean("ok"),"Unsupported version accepted");
+                boolean denied=false;
+                try{bridge.call("invalid-capability",new JSONObject().put("op","HELLO").toString());}
+                catch(SecurityException expected){denied=true;}
+                check(denied,"Invalid capability accepted");
+                note("PASS bridge: version negotiation, incompatible version rejection, capability rejection");
+                finish(Activity.RESULT_OK,result);return;
+            }
             if("host".equals(args.getString("role"))){
                 s.host(mode);for(int i=0;i<50&&s.invite().isEmpty();i++)Thread.sleep(100);
                 check(!s.invite().isEmpty(),"Host not ready");
                 write(context.getFilesDir().toPath().resolve("test-invite.txt"),s.invite());
                 JSONObject invitation=s.dispatch(new JSONObject().put("op","INVITE"));
                  write(context.getFilesDir().toPath().resolve("test-code.txt"),invitation.getString("code"));
+                 // Runner captures these privately to exercise the signed, non-debuggable release APK.
+                 result.putString("invite",s.invite());result.putString("code",invitation.getString("code"));
                  note("HOST_READY "+mode);
                 finish(Activity.RESULT_OK,result);return;
             }else{
-                if("code".equals(args.getString("join"))){String code=read(context.getFilesDir().toPath().resolve("test-code.txt"));check(s.dispatch(new JSONObject().put("op","JOIN").put("invite",code).put("transport",mode)).optBoolean("ok"),"Code join failed");}
-                else {String invite=read(context.getFilesDir().toPath().resolve("test-invite.txt"));s.join(invite,mode);}
-                for(int i=0;i<300&&"None".equals(s.state().optString("transport"));i++)Thread.sleep(100);
+                if("code".equals(args.getString("join"))){String code=args.containsKey("code")?args.getString("code"):read(context.getFilesDir().toPath().resolve("test-code.txt"));check(s.dispatch(new JSONObject().put("op","JOIN").put("invite",code).put("transport",mode)).optBoolean("ok"),"Code join failed");}
+                else {String invite=args.containsKey("invite")?args.getString("invite"):read(context.getFilesDir().toPath().resolve("test-invite.txt"));s.join(invite,mode);}
+                for(int i=0;i<300&&!Arrays.asList("LAN","Aware").contains(s.state().optString("transport"));i++)Thread.sleep(100);
                 note("STATE "+s.state());check(mode.equals(s.state().optString("transport"))||("Auto".equals(mode)&&Arrays.asList("LAN","Aware").contains(s.state().optString("transport"))),"Requested transport not connected");
                 if("recovery".equals(args.getString("role"))){
                     JSONObject before=request(s,new JSONObject().put("op","SNAPSHOT"));check(before.optBoolean("ok"),"Initial snapshot failed");

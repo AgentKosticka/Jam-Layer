@@ -24,7 +24,7 @@ public final class MainActivity extends Activity {
         if("app.morphe.jam.SCAN".equals(getIntent().getAction())){
             android.content.SharedPreferences p=getSharedPreferences("pair",0);
             String caller=getCallingPackage();
-            try{if(caller==null||!caller.equals(p.getString("package","")))throw new SecurityException();
+            try{if(caller==null||!caller.equals(p.getString("package",""))||!Trust.equal(p.getString("cert",""),Trust.certificate(this,caller)))throw new SecurityException();
                 Trust.capability(p.getString("cap",null),getIntent().getStringExtra("cap"));scanning=true;
             }catch(Exception e){finish();return;}
             if(checkSelfPermission("android.permission.CAMERA")!=PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{"android.permission.CAMERA"},3);else scan();return;
@@ -43,11 +43,13 @@ public final class MainActivity extends Activity {
     private void pair(){
         String pkg=getCallingPackage(),cap=getIntent().getStringExtra("cap");
         if(!validPackage(pkg)||cap==null||cap.length()!=64){finish();return;}
-        new AlertDialog.Builder(this).setTitle("Connect YouTube Music?").setMessage("Allow "+pkg+" to use Jam Layer for nearby queue sharing. Its signing certificate is not checked.")
+        final String signer;
+        try { signer=Trust.certificate(this,pkg); } catch(SecurityException e) { finish();return; }
+        new AlertDialog.Builder(this).setTitle("Connect YouTube Music?").setMessage("Allow "+pkg+" to use Jam Layer for nearby queue sharing. This approval is bound to the installed app and its signing certificate.")
             .setNegativeButton("Cancel",(d,w)->finish()).setPositiveButton("Connect",(d,w)->{
                 JamService service=JamService.active;
                 if(service!=null)service.end();
-                getSharedPreferences("pair",0).edit().putString("package",pkg).remove("cert").putString("cap",cap).commit();
+                getSharedPreferences("pair",0).edit().putString("package",pkg).putString("cert",signer).putString("cap",cap).commit();
                 if(service!=null)service.rebindMusic();
                 try{startForegroundService(JamService.startIntent(this));}catch(Exception e){Toast.makeText(this,"Could not start Jam Layer",Toast.LENGTH_LONG).show();finish();return;}
                 setResult(RESULT_OK);
