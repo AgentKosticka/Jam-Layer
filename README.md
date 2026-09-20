@@ -32,6 +32,11 @@ The music extension pins the Companion release certificate. Re-pair after upgrad
 from a development build that did not record a signer. A debug-signed Companion
 cannot substitute for the pinned release build.
 
+Version 1.0.2 forwards participant next/previous requests through the authenticated
+host command path. Use it with the matching Jam patch update on both devices.
+These controls respect the host's guest-edit permission; they never request
+local playback on the participant.
+
 Release acceptance requires manual tests on two real devices with the exact patch
 build: pairing, queue revision convergence, stale edits, reconnect, Aware and LAN
 connections, signer rejection and invitation expiry. Unit tests and APK installation

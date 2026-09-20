@@ -134,7 +134,7 @@ public final class JamService extends Service {
                         reply=(value.optBoolean("ok")&&value.optString("revision").equals(command.optString("revision"))?ok().put("unchanged",true).put("clock",value.optJSONObject("clock")):value).toString();
                     }peer.send(reply);continue;
                 }
-                if(!Arrays.asList("SNAPSHOT","ADD","PLAY_NEXT","REMOVE","MOVE","PLAY","SEEK").contains(op)){peer.send(error("Unsupported operation").toString());continue;}
+                if(!Arrays.asList("SNAPSHOT","ADD","PLAY_NEXT","REMOVE","MOVE","PLAY","SEEK","SKIP_NEXT","SKIP_PREVIOUS").contains(op)){peer.send(error("Unsupported operation").toString());continue;}
                 peer.send(hostCall(command,peer.clientId).toString());
             }
         }catch(Exception e){android.util.Log.i("MorpheJam","Participant disconnected: "+e.getClass().getSimpleName());}
