@@ -51,7 +51,7 @@ public final class CodePairing implements AutoCloseable {
                 public void onServiceResolved(NsdServiceInfo i){handler.post(()->{resolving[0]=false;resolve[0].run();if(result.isDone())return;
                     byte[] id=i.getAttributes().get("jam");if(id==null)return;String jam=new String(id,StandardCharsets.UTF_8);
                     try{if(!UUID.fromString(jam).toString().equals(jam))return;}catch(Exception e){return;}
-                    worker.execute(()->{if(result.isDone())return;try(Socket socket=new Socket()){sockets.add(socket);socket.connect(new InetSocketAddress(i.getHost(),i.getPort()),4000);String invitation=CodeExchange.take(socket,jam,code);result.complete(invitation);}catch(Exception ignored){}finally{sockets.removeIf(Socket::isClosed);}});
+                    worker.execute(()->{if(result.isDone())return;try(Socket socket=LanConnection.connect(i,4000)){sockets.add(socket);String invitation=CodeExchange.take(socket,jam,code);result.complete(invitation);}catch(Exception ignored){}finally{sockets.removeIf(Socket::isClosed);}});
                 });}
             });}catch(Exception e){resolving[0]=false;handler.postDelayed(resolve[0],500);}
         };

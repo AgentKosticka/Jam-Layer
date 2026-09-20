@@ -6,7 +6,7 @@ The matching optional YouTube Music patch targets **9.15.51**. The patch is avai
 
 ## Install
 
-Download the latest signed `Jam-Layer.apk` from [Releases](https://github.com/AgentKosticka/Jam-Layer/releases). Install it, then install a compatible YTM 9.15.51 build with the Jam queue sharing patch. Pair from the Jam row embedded in YTM.
+Download the latest signed `app-release.apk` from [Releases](https://github.com/AgentKosticka/Jam-Layer/releases). Install it, then install a compatible YTM 9.15.51 ARM64 build with the Jam queue sharing patch. Pair from the Jam row embedded in YTM.
 
 ## Build
 

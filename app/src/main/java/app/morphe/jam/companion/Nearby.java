@@ -84,7 +84,7 @@ public final class Nearby implements AutoCloseable {
                 resolving=false;if(closed)return;resolve();
                 byte[] id=i.getAttributes().get("jam");
                 if(id!=null && invite.jamId.equals(new String(id,StandardCharsets.UTF_8))) {
-                    Runnable connect=()->{if(closed)return;workers.execute(()->{Socket s=new Socket();try{s.connect(new InetSocketAddress(i.getHost(),i.getPort()),5000); if(closed)s.close();else listener.connect(s,"LAN");}catch(Exception e){try{s.close();}catch(Exception ignored){} listener.status("LAN connection failed");}});};
+                    Runnable connect=()->{if(closed)return;workers.execute(()->{Socket s=null;try{s=LanConnection.connect(i,5000);if(closed)s.close();else listener.connect(s,"LAN");}catch(Exception e){if(s!=null)try{s.close();}catch(Exception ignored){}android.util.Log.w("MorpheJam","LAN connection failed",e);listener.status("LAN connection failed: "+e.getClass().getSimpleName());}});};
                     handler.postDelayed(connect,"Auto".equals(preference)?4000:0);
                 }
             });}
