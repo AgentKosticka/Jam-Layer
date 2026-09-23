@@ -9,9 +9,20 @@ final class SocketChannelTransport implements ChannelTransport {
   private final Socket socket;
   private final DataInputStream input;
   private final DataOutputStream output;
+  private final AutoCloseable path;
+  private boolean closed;
 
   SocketChannelTransport(Socket socket) throws IOException {
+    this(socket, null);
+  }
+
+  /**
+   * Keeps a transport-specific resource (for example, an Aware data-path
+   * request) alive for exactly as long as its socket is in use.
+   */
+  SocketChannelTransport(Socket socket, AutoCloseable path) throws IOException {
     this.socket = socket;
+    this.path = path;
     socket.setTcpNoDelay(true);
     input = new DataInputStream(socket.getInputStream());
     output = new DataOutputStream(socket.getOutputStream());
@@ -46,7 +57,21 @@ final class SocketChannelTransport implements ChannelTransport {
   }
 
   @Override
-  public void close() throws IOException {
-    socket.close();
+  public synchronized void close() throws IOException {
+    if (closed) return;
+    closed = true;
+    IOException failure = null;
+    try {
+      socket.close();
+    } catch (IOException error) {
+      failure = error;
+    }
+    if (path != null) try {
+      path.close();
+    } catch (Exception error) {
+      if (failure == null) failure = new IOException("Path close failed", error);
+      else failure.addSuppressed(error);
+    }
+    if (failure != null) throw failure;
   }
 }

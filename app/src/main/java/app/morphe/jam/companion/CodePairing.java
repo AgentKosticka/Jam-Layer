@@ -10,6 +10,66 @@ import java.util.concurrent.*;
 public final class CodePairing implements AutoCloseable {
 
   private static final String TYPE = "_morphepair._tcp.";
+
+  interface HandoffListener {
+    /** Returns true only after ownership of the connection has transferred. */
+    boolean onHandoff(Handoff handoff);
+  }
+
+  /** A PAKE-authenticated connection that can continue as the Jam channel. */
+  static final class Handoff implements AutoCloseable {
+
+    final String invitation, transport, route;
+    private Socket socket;
+    private AutoCloseable path;
+
+    Handoff(
+      String invitation,
+      Socket socket,
+      String transport,
+      String route,
+      AutoCloseable path
+    ) {
+      this.invitation = invitation;
+      this.socket = socket;
+      this.transport = transport;
+      this.route = route;
+      this.path = path;
+    }
+
+    synchronized ChannelTransport takeConnection() throws java.io.IOException {
+      if (socket == null) throw new java.io.IOException("Pairing connection closed");
+      Socket value = socket;
+      AutoCloseable resource = path;
+      socket = null;
+      path = null;
+      try {
+        return new SocketChannelTransport(value, resource);
+      } catch (java.io.IOException error) {
+        close(value, resource);
+        throw error;
+      }
+    }
+
+    @Override
+    public synchronized void close() {
+      Socket value = socket;
+      AutoCloseable resource = path;
+      socket = null;
+      path = null;
+      close(value, resource);
+    }
+
+    private static void close(Socket socket, AutoCloseable path) {
+      if (socket != null) try {
+        socket.close();
+      } catch (Exception ignored) {}
+      if (path != null) try {
+        path.close();
+      } catch (Exception ignored) {}
+    }
+  }
+
   private final Context context;
   private final LocalNetworkTracker topology;
   private final LanAdvertiser advertiser;
@@ -19,12 +79,22 @@ public final class CodePairing implements AutoCloseable {
   private final long expires = System.currentTimeMillis() + 10 * 60 * 1000L;
   private final ExecutorService workers = Executors.newFixedThreadPool(3);
   private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
+  private final HandoffListener handoffListener;
   private AwareCodePairing aware;
   private volatile boolean closed;
 
   public CodePairing(Context context, Invitation invitation) throws Exception {
+    this(context, invitation, null);
+  }
+
+  CodePairing(
+    Context context,
+    Invitation invitation,
+    HandoffListener handoffListener
+  ) throws Exception {
     this.context = context.getApplicationContext();
     invite = invitation;
+    this.handoffListener = handoffListener;
     server = new ServerSocket(0);
     topology = new LocalNetworkTracker(this.context);
     topology.start();
@@ -69,11 +139,32 @@ public final class CodePairing implements AutoCloseable {
           inWindow++;
           sockets.add(socket);
           workers.execute(() -> {
-            try (Socket connection = socket) {
-              CodeExchange.give(connection, invite, code);
+            boolean handedOff = false;
+            AwareDataPath path = null;
+            try {
+              CodeExchange.giveAndKeep(socket, invite, code);
+              AwareCodePairing pairing = aware;
+              if (pairing != null) path = pairing.takeReadyPath(socket);
+              Handoff handoff = new Handoff(
+                null,
+                socket,
+                path == null ? "LAN" : "Aware",
+                path == null ? "SYSTEM_ROUTED_FALLBACK" : "AWARE_NETWORK",
+                path
+              );
+              if (handoffListener != null) handedOff = handoffListener.onHandoff(
+                handoff
+              );
+              if (!handedOff) handoff.close();
             } catch (Exception ignored) {
             } finally {
               sockets.remove(socket);
+              if (!handedOff) {
+                try {
+                  socket.close();
+                } catch (Exception ignored) {}
+                if (path != null) path.close();
+              }
             }
           });
         } catch (Exception error) {
@@ -113,13 +204,13 @@ public final class CodePairing implements AutoCloseable {
     workers.shutdownNow();
   }
 
-  public static String find(Context context, String entered) throws Exception {
+  public static Handoff find(Context context, String entered) throws Exception {
     String code = CodeExchange.normalize(entered);
     Context app = context.getApplicationContext();
     LocalNetworkTracker topology = new LocalNetworkTracker(app);
     topology.start();
     ScheduledExecutorService worker = Executors.newScheduledThreadPool(3);
-    CompletableFuture<String> result = new CompletableFuture<>();
+    CompletableFuture<Handoff> result = new CompletableFuture<>();
     AwareCodePairing aware = AwareCodePairing.find(app, code, result);
     Map<String, LanEndpoint> endpoints = new ConcurrentHashMap<>();
     Map<String, Integer> attempts = new ConcurrentHashMap<>();
@@ -175,7 +266,17 @@ public final class CodePairing implements AutoCloseable {
                 );
                 socket = connected.socket;
                 sockets.add(socket);
-                result.complete(CodeExchange.take(socket, jam, code));
+                Handoff handoff = new Handoff(
+                  CodeExchange.takeAndKeep(socket, jam, code),
+                  socket,
+                  "LAN",
+                  connected.route.name(),
+                  null
+                );
+                if (result.complete(handoff)) {
+                  sockets.remove(socket);
+                  socket = null;
+                } else handoff.close();
               } catch (Exception ignored) {
                 if (!result.isDone() && number < 3) try {
                   worker.schedule(
@@ -201,15 +302,19 @@ public final class CodePairing implements AutoCloseable {
       }
     );
     browser.start();
+    Handoff found = null;
     try {
-      return result.get(30, TimeUnit.SECONDS);
+      found = result.get(30, TimeUnit.SECONDS);
+      return found;
     } catch (TimeoutException error) {
       throw new IllegalArgumentException(
         "Code not found or expired. Keep both devices nearby, or scan the host QR invitation."
       );
     } finally {
       result.cancel(false);
-      aware.close();
+      // An Aware data path belongs to the returned handoff. Closing its
+      // discovery client here would tear down the freshly promoted socket.
+      if (found == null || !"Aware".equals(found.transport)) aware.close();
       browser.close();
       topology.close();
       for (Socket socket : sockets)

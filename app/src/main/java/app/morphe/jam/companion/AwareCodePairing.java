@@ -57,7 +57,7 @@ final class AwareCodePairing implements AutoCloseable {
   private final boolean host;
   private final String code, tag, jam;
   private final int port;
-  private final CompletableFuture<String> result;
+  private final CompletableFuture<CodePairing.Handoff> result;
   private WifiAwareSession aware;
   private DiscoverySession session;
   private BroadcastReceiver awareState;
@@ -71,7 +71,7 @@ final class AwareCodePairing implements AutoCloseable {
     Invitation invite,
     String code,
     int port,
-    CompletableFuture<String> result
+    CompletableFuture<CodePairing.Handoff> result
   ) {
     this.context = context.getApplicationContext();
     host = invite != null;
@@ -104,7 +104,7 @@ final class AwareCodePairing implements AutoCloseable {
   static AwareCodePairing find(
     Context context,
     String code,
-    CompletableFuture<String> result
+    CompletableFuture<CodePairing.Handoff> result
   ) {
     AwareCodePairing pairing = new AwareCodePairing(
       context,
@@ -466,21 +466,39 @@ final class AwareCodePairing implements AutoCloseable {
               value.close();
               return;
             }
-            try (Socket connection = socket) {
+            boolean handedOff = false;
+            try {
               android.util.Log.i("MorpheJam", "Aware code path socket connected");
-              String invitation = CodeExchange.take(
-                connection,
-                candidate.jam,
-                code
+              CodePairing.Handoff handoff = new CodePairing.Handoff(
+                CodeExchange.takeAndKeep(
+                  socket,
+                  candidate.jam,
+                  code
+                ),
+                socket,
+                "Aware",
+                "AWARE_NETWORK",
+                retainPath(value)
               );
+              // Remove the path before completing the future: completion wakes
+              // CodePairing.find(), whose cleanup closes all paths still owned
+              // by this pairing instance.
+              paths.remove(peer, value);
               retries.remove(peer);
-              if (result != null) result.complete(invitation);
+              if (result != null && result.complete(handoff)) {
+                handedOff = true;
+              } else handoff.close();
             } catch (Exception error) {
               failedPath(peer, candidate, expected, value);
               return;
+            } finally {
+              if (!handedOff) {
+                try {
+                  socket.close();
+                } catch (Exception ignored) {}
+                value.close();
+              }
             }
-            value.close();
-            paths.remove(peer);
           }
 
           @Override
@@ -526,6 +544,38 @@ final class AwareCodePairing implements AutoCloseable {
     paths.remove(peer);
     path.close();
     retry(peer, candidate, expected);
+  }
+
+  /**
+   * A host accepts an Aware socket through its ServerSocket. Once PAKE has
+   * succeeded, retain that matching data-path request with the socket rather
+   * than letting the pairing teardown terminate the live Jam connection.
+   */
+  AwareDataPath takeReadyPath(Socket socket) {
+    if (!host || !(socket.getInetAddress() instanceof Inet6Address)) return null;
+    for (Map.Entry<PeerHandle, AwareDataPath> entry : paths.entrySet()) {
+      AwareDataPath path = entry.getValue();
+      if (
+        path.state() == AwareDataPath.State.AVAILABLE &&
+        paths.remove(entry.getKey(), path)
+      ) return path;
+    }
+    return null;
+  }
+
+  /** Keeps the discovery client alive while its transferred data path is live. */
+  private AutoCloseable retainPath(AwareDataPath path) {
+    return new AutoCloseable() {
+      private boolean released;
+
+      @Override
+      public synchronized void close() {
+        if (released) return;
+        released = true;
+        path.close();
+        AwareCodePairing.this.close();
+      }
+    };
   }
 
   private void retry(PeerHandle peer, Candidate candidate, int expected) {

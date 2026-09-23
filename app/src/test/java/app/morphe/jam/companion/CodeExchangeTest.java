@@ -20,6 +20,25 @@ public class CodeExchangeTest {
             assertTrue(host.get(10,TimeUnit.SECONDS));
         }finally{worker.shutdownNow();invite.destroy();}
     }
+    @Test public void successfulPairingSocketCanBecomeJamChannel()throws Exception{
+        Invitation invite=new Invitation();String code=CodeExchange.generate();ExecutorService worker=Executors.newSingleThreadExecutor();
+        try(ServerSocket server=new ServerSocket(0)){
+            Future<String> host=worker.submit(()->{try(Socket socket=server.accept()){
+                CodeExchange.giveAndKeep(socket,invite,code);
+                try(SecureChannel jam=new SecureChannel(socket,true,invite.jamId,invite.secret,null)){
+                    assertEquals("joined",jam.receive());jam.send("connected");return jam.clientId;
+                }
+            }});
+            String identity=java.util.UUID.randomUUID().toString();
+            try(Socket socket=new Socket("127.0.0.1",server.getLocalPort())){
+                assertEquals(invite.uri(),CodeExchange.takeAndKeep(socket,invite.jamId,code));
+                try(SecureChannel jam=new SecureChannel(socket,false,invite.jamId,invite.secret,identity)){
+                    jam.send("joined");assertEquals("connected",jam.receive());
+                }
+            }
+            assertEquals(identity,host.get(10,TimeUnit.SECONDS));
+        }finally{worker.shutdownNow();invite.destroy();}
+    }
     @Test public void codeAlphabetAndFormatting(){
         for(int i=0;i<100;i++)assertEquals(8,CodeExchange.normalize(CodeExchange.generate()).length());
         assertEquals("ABCDEFGH",CodeExchange.normalize("abcd-efgh"));

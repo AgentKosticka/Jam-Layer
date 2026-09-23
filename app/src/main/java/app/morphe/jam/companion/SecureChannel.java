@@ -104,7 +104,11 @@ public final class SecureChannel implements Closeable {
     public void setReadTimeout(int millis) throws IOException {
         connection.setReadTimeout(millis);
     }
+    /** Erases transient handshake keys while leaving a handoff socket open. */
+    void discardKeys() {
+        Arrays.fill(txKey, (byte)0); Arrays.fill(rxKey, (byte)0);
+    }
     @Override public void close() throws IOException {
-        Arrays.fill(txKey, (byte)0); Arrays.fill(rxKey, (byte)0); connection.close();
+        discardKeys(); connection.close();
     }
 }

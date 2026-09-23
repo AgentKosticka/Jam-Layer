@@ -39,3 +39,10 @@ were on separate network configurations. The guest discovered the host code,
 completed its authenticated Wi-Fi Aware code exchange, then discovered and
 connected to the Jam over `AWARE_NETWORK`. It loaded the 25-item host queue and
 recovered an intentionally closed secure channel without queue changes.
+
+2026-09-23 code-handoff smoke check: the updated Companion was installed on
+both devices. The SM-X620 promoted its short-code Aware pairing socket directly
+to an authenticated Jam channel on `AWARE_NETWORK` 282 ms after that socket
+became available. Both devices passed bridge capability smoke checks. The
+queue-edit portion was not run because the host's active queue contained only
+two items; its test fixture requires at least three.

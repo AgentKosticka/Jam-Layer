@@ -249,9 +249,12 @@ public final class JamService extends Service {
     role = "Joining";
     message = "Finding the code on nearby devices…";
     try {
-      String value = CodePairing.find(this, code);
-      if (epoch != sessionEpoch) return error("Joining cancelled");
-      join(value, mode);
+      CodePairing.Handoff handoff = CodePairing.find(this, code);
+      if (epoch != sessionEpoch) {
+        handoff.close();
+        return error("Joining cancelled");
+      }
+      join(handoff.invitation, mode, handoff);
       return ok();
     } catch (Exception e) {
       if (epoch == sessionEpoch) {
@@ -316,6 +319,14 @@ public final class JamService extends Service {
   }
 
   public void join(String value, String mode) {
+    join(value, mode, null);
+  }
+
+  private void join(
+    String value,
+    String mode,
+    CodePairing.Handoff handoff
+  ) {
     final Invitation next = new Invitation(value);
     end();
     invitation = next;
@@ -323,10 +334,126 @@ public final class JamService extends Service {
     selectedMode = mode;
     transport = "Connecting";
     wakeLock.acquire(Math.max(1, next.expires - System.currentTimeMillis()));
-    message = "Discovering host";
+    boolean reusePairing = handoff != null && (
+      "Auto".equals(mode) || mode.equals(handoff.transport)
+    );
+    if (!reusePairing && handoff != null) handoff.close();
+    message = reusePairing ? "Authenticating paired host" : "Discovering host";
     discoveryStarted = System.currentTimeMillis();
     nearby = new Nearby(this, next, false, 0, mode, listener);
     nearby.start();
+    if (reusePairing) {
+      ChannelTransport connection = null;
+      try {
+        connection = handoff.takeConnection();
+        // Register before handing the connection to a worker so end() can close
+        // it if the user cancels during the Jam handshake.
+        connections.add(connection);
+        ChannelTransport direct = connection;
+        workers.execute(
+          () -> authenticatePairedHost(
+            next,
+            direct,
+            handoff.transport,
+            handoff.route
+          )
+        );
+      } catch (Exception error) {
+        if (connection != null) {
+          connections.remove(connection);
+          try {
+            connection.close();
+          } catch (Exception ignored) {}
+        }
+        handoff.close();
+        android.util.Log.w("MorpheJam", "Paired connection unavailable", error);
+      }
+    }
+  }
+
+  /** Promotes the already-open short-code socket instead of rediscovering it. */
+  private void authenticatePairedHost(
+    Invitation expected,
+    ChannelTransport connection,
+    String pairedTransport,
+    String route
+  ) {
+    SecureChannel authenticated = null;
+    boolean won = false;
+    try {
+      authenticated = new SecureChannel(
+        connection,
+        false,
+        expected.jamId,
+        expected.secret,
+        identity
+      );
+      synchronized (connectionLock) {
+        if (
+          invitation == expected &&
+          expected.valid() &&
+          "Participant".equals(role) &&
+          channel == null
+        ) {
+          channel = authenticated;
+          connections.add(connection);
+          transport = pairedTransport;
+          lanRoute = route;
+          message = "Authenticated host connected";
+          won = true;
+        }
+      }
+      if (!won) return;
+      android.util.Log.i(
+        "MorpheJam",
+        "Promoted paired transport=" + pairedTransport + " route=" + route
+      );
+      Nearby discovery = nearby;
+      nearby = null;
+      if (discovery != null) discovery.close();
+      workers.execute(() -> sync(expected));
+    } catch (Exception error) {
+      android.util.Log.w("MorpheJam", "Paired host authentication failed", error);
+    } finally {
+      if (!won) {
+        if (authenticated != null) try {
+          authenticated.close();
+        } catch (Exception ignored) {}
+        else try {
+          connection.close();
+        } catch (Exception ignored) {}
+        connections.remove(connection);
+      }
+    }
+  }
+
+  private boolean acceptPairedParticipant(
+    Invitation expected,
+    CodePairing.Handoff handoff
+  ) {
+    if (
+      invitation != expected ||
+      !"Host".equals(role) ||
+      connections.size() >= 8
+    ) {
+      handoff.close();
+      return false;
+    }
+    try {
+      ChannelTransport connection = handoff.takeConnection();
+      connections.add(connection);
+      transport = handoff.transport;
+      lanRoute = handoff.route;
+      workers.execute(() -> serve(connection, expected, null));
+      android.util.Log.i(
+        "MorpheJam",
+        "Promoted paired participant transport=" + handoff.transport
+      );
+      return true;
+    } catch (Exception error) {
+      handoff.close();
+      return false;
+    }
   }
 
   private void reconnect(Invitation expected) {
@@ -683,7 +810,12 @@ public final class JamService extends Service {
         try {
           if (codePairing == null || !codePairing.valid()) {
             if (codePairing != null) codePairing.close();
-            codePairing = new CodePairing(this, invitation);
+            Invitation expected = invitation;
+            codePairing = new CodePairing(
+              this,
+              expected,
+              handoff -> acceptPairedParticipant(expected, handoff)
+            );
           }
           reply
             .put("code", codePairing.display())

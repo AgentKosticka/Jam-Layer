@@ -19,7 +19,10 @@ Discovery and registration failures retry with bounded backoff. Short-code
 lookup retries transient LAN connection failures while Aware lookup runs in
 parallel. The code bootstrap uses an authenticated Aware data path because
 Android permits a port-bearing Aware path only when it is secured; J-PAKE still
-authenticates the short code before the invitation is released.
+authenticates the short code before the invitation is released. A successful
+code-pairing socket is then promoted directly into the Jam `SecureChannel`;
+the already-established Aware data path stays open for that channel rather
+than being torn down and rediscovered.
 
 TCP arrival does not pick the session:
 each candidate authenticates its existing `SecureChannel` outside the session lock,

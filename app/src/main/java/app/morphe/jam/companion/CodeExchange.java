@@ -37,13 +37,27 @@ public final class CodeExchange {
         try{return SecureChannel.hmac(prk,(prefix+"invitation-key\u0001").getBytes(StandardCharsets.UTF_8));}finally{Arrays.fill(prk,(byte)0);}
     }
     public static void give(Socket socket,Invitation invite,String code)throws Exception{
+        try{giveAndKeep(socket,invite,code);}finally{socket.close();}
+    }
+    /** Delivers the invitation but leaves the authenticated socket ready for Jam. */
+    static void giveAndKeep(Socket socket,Invitation invite,String code)throws Exception{
         byte[] key=agree(socket,true,invite.jamId,code);
-        try(SecureChannel secure=new SecureChannel(socket,true,invite.jamId,key,null)){secure.send(new JSONObject().put("invite",invite.uri()).toString());}finally{Arrays.fill(key,(byte)0);}
+        try{
+            SecureChannel secure=new SecureChannel(socket,true,invite.jamId,key,null);
+            try{secure.send(new JSONObject().put("invite",invite.uri()).toString());}finally{secure.discardKeys();}
+        }finally{Arrays.fill(key,(byte)0);}
     }
     public static String take(Socket socket,String jam,String code)throws Exception{
+        try{return takeAndKeep(socket,jam,code);}finally{socket.close();}
+    }
+    /** Receives the invitation but leaves the authenticated socket ready for Jam. */
+    static String takeAndKeep(Socket socket,String jam,String code)throws Exception{
         byte[] key=agree(socket,false,jam,code);
-        try(SecureChannel secure=new SecureChannel(socket,false,jam,key,UUID.randomUUID().toString())){
-            String value=new JSONObject(secure.receive()).getString("invite");Invitation invitation=new Invitation(value);try{if(!invitation.jamId.equals(jam))throw new IOException("Invitation session changed");return value;}finally{invitation.destroy();}
+        try{
+            SecureChannel secure=new SecureChannel(socket,false,jam,key,UUID.randomUUID().toString());
+            try{
+                String value=new JSONObject(secure.receive()).getString("invite");Invitation invitation=new Invitation(value);try{if(!invitation.jamId.equals(jam))throw new IOException("Invitation session changed");return value;}finally{invitation.destroy();}
+            }finally{secure.discardKeys();}
         }finally{Arrays.fill(key,(byte)0);}
     }
 }
