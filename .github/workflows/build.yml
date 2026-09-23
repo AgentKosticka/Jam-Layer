@@ -2,10 +2,12 @@ name: Build and test
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -20,4 +22,21 @@ jobs:
         with:
           packages: platform-tools
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
-      - run: ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon
+      - run: ./gradlew :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest --no-daemon
+      - name: Build signed release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          JAM_KEYSTORE_BASE64: ${{ secrets.JAM_KEYSTORE_BASE64 }}
+          JAM_KEYSTORE_PASSWORD: ${{ secrets.JAM_KEYSTORE_PASSWORD }}
+          JAM_KEY_ALIAS: ${{ secrets.JAM_KEY_ALIAS }}
+          JAM_KEY_PASSWORD: ${{ secrets.JAM_KEY_PASSWORD }}
+        run: |
+          printf '%s' "$JAM_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/jam-layer-release.jks"
+          JAM_KEYSTORE_PATH="$RUNNER_TEMP/jam-layer-release.jks" ./gradlew :app:assembleRelease --no-daemon
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Jam Layer ${{ github.ref_name }}
+          body: Signed Jam Layer APK. See the repository README for compatible patch source and installation notes.
+          files: app/build/outputs/apk/release/app-release.apk

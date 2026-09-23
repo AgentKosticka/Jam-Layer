@@ -2,10 +2,22 @@ package app.morphe.jam.companion;
 import org.junit.Test;
 import static org.junit.Assert.*;
 import java.net.*;
+import java.io.*;
 import java.util.*;
 import java.util.concurrent.*;
 
 public class SecureChannelTest {
+    private static final class MemoryTransport implements ChannelTransport {
+        private static final byte[] CLOSED=new byte[0];
+        final BlockingQueue<byte[]> received=new ArrayBlockingQueue<>(8); MemoryTransport peer;
+        volatile boolean closed; volatile int timeout=5000;
+        static MemoryTransport[] pair(){MemoryTransport a=new MemoryTransport(),b=new MemoryTransport();a.peer=b;b.peer=a;return new MemoryTransport[]{a,b};}
+        public byte[] read(int max)throws IOException{try{byte[] value=received.poll(timeout,TimeUnit.MILLISECONDS);if(value==null)throw new SocketTimeoutException();if(value==CLOSED||closed)throw new EOFException();if(value.length>max)throw new IOException("Frame size");return value;}catch(InterruptedException e){Thread.currentThread().interrupt();throw new IOException(e);}}
+        public void write(byte[] record)throws IOException{if(closed||peer.closed||!peer.received.offer(record.clone()))throw new IOException("Closed");}
+        public void setReadTimeout(int millis){timeout=millis;}
+        public boolean isClosed(){return closed;}
+        public void close(){closed=true;received.offer(CLOSED);}
+    }
     private static final class CapturingSocket extends Socket {
         final java.io.ByteArrayOutputStream captured=new java.io.ByteArrayOutputStream();
         final java.io.OutputStream raw;
@@ -47,6 +59,15 @@ public class SecureChannelTest {
                 assertEquals(id,received.get(5,TimeUnit.SECONDS));
             }finally{executor.shutdownNow();}
         }
+    }
+    @Test public void encryptedRoundTripOverRecordTransport()throws Exception{
+        Invitation invite=new Invitation();MemoryTransport[] pair=MemoryTransport.pair();ExecutorService executor=Executors.newSingleThreadExecutor();
+        try{
+            Future<String> host=executor.submit(()->{try(SecureChannel secure=new SecureChannel(pair[0],true,invite.jamId,invite.secret,null)){assertEquals("nearby",secure.receive());secure.send("connected");return secure.clientId;}});
+            String id=UUID.randomUUID().toString();
+            try(SecureChannel client=new SecureChannel(pair[1],false,invite.jamId,invite.secret,id)){client.send("nearby");assertEquals("connected",client.receive());}
+            assertEquals(id,host.get(5,TimeUnit.SECONDS));
+        }finally{executor.shutdownNow();}
     }
     @Test public void wrongSecretIsRejected()throws Exception{
         Invitation invite=new Invitation();

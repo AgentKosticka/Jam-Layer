@@ -2,7 +2,7 @@ plugins { id("com.android.application") }
 android {
     namespace = "app.morphe.jam.companion"
     compileSdk = 36
-    defaultConfig { applicationId = "app.morphe.jam.companion"; minSdk = 26; targetSdk = 37; versionCode = 3; versionName = "1.0.2"; testInstrumentationRunner = "app.morphe.jam.companion.DeviceScenario" }
+    defaultConfig { applicationId = "app.morphe.jam.companion"; minSdk = 26; targetSdk = 37; versionCode = 6; versionName = "1.0.5"; testInstrumentationRunner = "app.morphe.jam.companion.DeviceScenario" }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_11; targetCompatibility = JavaVersion.VERSION_11 }
     signingConfigs {
         create("release") {

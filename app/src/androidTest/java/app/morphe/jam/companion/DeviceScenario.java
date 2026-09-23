@@ -53,14 +53,17 @@ public final class DeviceScenario extends Instrumentation {
                 JSONObject invitation=s.dispatch(new JSONObject().put("op","INVITE"));
                  write(context.getFilesDir().toPath().resolve("test-code.txt"),invitation.getString("code"));
                  // Runner captures these privately to exercise the signed, non-debuggable release APK.
-                 result.putString("invite",s.invite());result.putString("code",invitation.getString("code"));
+                result.putString("invite",s.invite());result.putString("code",invitation.getString("code"));
                  note("HOST_READY "+mode);
+                if ("true".equals(args.getString("hold"))) {
+                    for (int i=0;i<900&&s.invite().length()>0;i++) Thread.sleep(100);
+                }
                 finish(Activity.RESULT_OK,result);return;
             }else{
                 if("code".equals(args.getString("join"))){String code=args.containsKey("code")?args.getString("code"):read(context.getFilesDir().toPath().resolve("test-code.txt"));check(s.dispatch(new JSONObject().put("op","JOIN").put("invite",code).put("transport",mode)).optBoolean("ok"),"Code join failed");}
                 else {String invite=args.containsKey("invite")?args.getString("invite"):read(context.getFilesDir().toPath().resolve("test-invite.txt"));s.join(invite,mode);}
-                for(int i=0;i<300&&!Arrays.asList("LAN","Aware").contains(s.state().optString("transport"));i++)Thread.sleep(100);
-                note("STATE "+s.state());check(mode.equals(s.state().optString("transport"))||("Auto".equals(mode)&&Arrays.asList("LAN","Aware").contains(s.state().optString("transport"))),"Requested transport not connected");
+                for(int i=0;i<300&&!Arrays.asList("LAN","Aware","Nearby").contains(s.state().optString("transport"));i++)Thread.sleep(100);
+                note("STATE "+s.state());check(mode.equals(s.state().optString("transport"))||("Auto".equals(mode)&&Arrays.asList("LAN","Aware","Nearby").contains(s.state().optString("transport"))),"Requested transport not connected");
                 if("recovery".equals(args.getString("role"))){
                     JSONObject before=request(s,new JSONObject().put("op","SNAPSHOT"));check(before.optBoolean("ok"),"Initial snapshot failed");
                     // Fault injection is confined to this separate instrumentation APK.

@@ -13,9 +13,7 @@ import javax.crypto.spec.*;
 public final class SecureChannel implements Closeable {
     public static final int LIMIT = 1048576;
     private static final SecureRandom RANDOM = new SecureRandom();
-    private final Socket socket;
-    private final DataInputStream input;
-    private final DataOutputStream output;
+    private final ChannelTransport connection;
     private final byte[] txKey, rxKey;
     private final int txDirection, rxDirection;
     private long sent, received;
@@ -33,26 +31,20 @@ public final class SecureChannel implements Closeable {
         return out.toByteArray();
     }
     private static byte[] utf(String s) { return s.getBytes(StandardCharsets.UTF_8); }
-    private static byte[] read(DataInputStream in, int max) throws IOException {
-        int size = in.readInt();
-        if (size < 1 || size > max) throw new IOException("Frame size");
-        byte[] data = new byte[size]; in.readFully(data); return data;
-    }
-    private static void write(DataOutputStream out, byte[] data) throws IOException {
-        if (data.length > LIMIT) throw new IOException("Frame size");
-        out.writeInt(data.length); out.write(data); out.flush();
-    }
     public SecureChannel(Socket socket, boolean host, String jamId, byte[] secret, String identity)
             throws IOException, GeneralSecurityException {
-        this.socket = socket;
-        socket.setSoTimeout(15000); socket.setTcpNoDelay(true);
-        input = new DataInputStream(socket.getInputStream()); output = new DataOutputStream(socket.getOutputStream());
+        this(new SocketChannelTransport(socket), host, jamId, secret, identity);
+    }
+    public SecureChannel(ChannelTransport connection, boolean host, String jamId, byte[] secret, String identity)
+            throws IOException, GeneralSecurityException {
+        this.connection = connection;
+        connection.setReadTimeout(15000);
         if (secret.length != 32) throw new GeneralSecurityException("Secret length");
         byte[] hostNonce, clientNonce;
         if (host) {
             hostNonce = random(32);
-            write(output, concat(utf("MORPHEJAM/1:" + jamId + ":"), hostNonce));
-            byte[] hello = read(input, 128);
+            write(concat(utf("MORPHEJAM/1:" + jamId + ":"), hostNonce));
+            byte[] hello = read(128);
             if (hello.length != 100) throw new GeneralSecurityException("Client hello");
             clientNonce = Arrays.copyOfRange(hello, 0, 32);
             clientId = new String(hello, 32, 36, StandardCharsets.US_ASCII);
@@ -60,18 +52,18 @@ public final class SecureChannel implements Closeable {
             byte[] transcript = concat(utf("MORPHEJAM/1:" + jamId + ":" + clientId), hostNonce, clientNonce);
             if (!MessageDigest.isEqual(Arrays.copyOfRange(hello, 68, 100), hmac(secret, concat(utf("client"), transcript))))
                 throw new GeneralSecurityException("Authentication failed");
-            write(output, hmac(secret, concat(utf("host"), transcript)));
+            write(hmac(secret, concat(utf("host"), transcript)));
         } else {
             clientId = UUID.fromString(identity).toString();
-            byte[] challenge = read(input, 128);
+            byte[] challenge = read(128);
             byte[] prefix = utf("MORPHEJAM/1:" + jamId + ":");
             if (challenge.length != prefix.length + 32 || !Arrays.equals(prefix, Arrays.copyOf(challenge, prefix.length)))
                 throw new GeneralSecurityException("Protocol or session mismatch");
             hostNonce = Arrays.copyOfRange(challenge, prefix.length, challenge.length);
             clientNonce = random(32);
             byte[] transcript = concat(utf("MORPHEJAM/1:" + jamId + ":" + clientId), hostNonce, clientNonce);
-            write(output, concat(clientNonce, utf(clientId), hmac(secret, concat(utf("client"), transcript))));
-            if (!MessageDigest.isEqual(read(input, 32), hmac(secret, concat(utf("host"), transcript))))
+            write(concat(clientNonce, utf(clientId), hmac(secret, concat(utf("client"), transcript))));
+            if (!MessageDigest.isEqual(read(32), hmac(secret, concat(utf("host"), transcript))))
                 throw new GeneralSecurityException("Host authentication failed");
         }
         // HKDF extract then single-block expand with separate direction labels.
@@ -83,8 +75,10 @@ public final class SecureChannel implements Closeable {
         Arrays.fill(prk, (byte)0);
         // Native insertion includes a server callback; allow it to finish before
         // treating a connection as lost. Handshake stays bounded to 15 seconds.
-        socket.setSoTimeout(45000);
+        connection.setReadTimeout(45000);
     }
+    private byte[] read(int max) throws IOException { return connection.read(max); }
+    private void write(byte[] data) throws IOException { connection.write(data); }
     private static byte[] crypt(int mode, byte[] key, int direction, long sequence, byte[] data)
             throws GeneralSecurityException {
         byte[] nonce = ByteBuffer.allocate(12).putInt(direction).putLong(sequence).array();
@@ -97,17 +91,20 @@ public final class SecureChannel implements Closeable {
         byte[] plain = utf(json);
         if (plain.length > LIMIT - 24 || sent == Long.MAX_VALUE) throw new IOException("Frame limit");
         long seq = ++sent;
-        write(output, concat(ByteBuffer.allocate(8).putLong(seq).array(), crypt(Cipher.ENCRYPT_MODE, txKey, txDirection, seq, plain)));
+        write(concat(ByteBuffer.allocate(8).putLong(seq).array(), crypt(Cipher.ENCRYPT_MODE, txKey, txDirection, seq, plain)));
     }
     public String receive() throws IOException, GeneralSecurityException {
-        byte[] frame = read(input, LIMIT);
+        byte[] frame = read(LIMIT);
         if (frame.length < 24) throw new IOException("Truncated frame");
         long seq = ByteBuffer.wrap(frame).getLong();
         if (seq != received + 1 || seq <= 0) throw new GeneralSecurityException("Replay or sequence gap");
         byte[] plain = crypt(Cipher.DECRYPT_MODE, rxKey, rxDirection, seq, Arrays.copyOfRange(frame, 8, frame.length));
         received = seq; return new String(plain, StandardCharsets.UTF_8);
     }
+    public void setReadTimeout(int millis) throws IOException {
+        connection.setReadTimeout(millis);
+    }
     @Override public void close() throws IOException {
-        Arrays.fill(txKey, (byte)0); Arrays.fill(rxKey, (byte)0); socket.close();
+        Arrays.fill(txKey, (byte)0); Arrays.fill(rxKey, (byte)0); connection.close();
     }
 }

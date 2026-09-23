@@ -12,7 +12,8 @@ Download the latest signed `app-release.apk` from [Releases](https://github.com/
 
 Requires JDK 25 and Android SDK 37. Run `./gradlew :app:testDebugUnitTest :app:assembleDebug` for local development. Release builds are signed in GitHub Actions using repository Actions secrets; no signing key belongs in source control.
 
-The release signer certificate SHA-256 is pinned in the companion and matching Morphe patch. Replacing the signing key requires updating that pin and distributing a compatible patch build.
+Companion forks may use their own signing keys. Pairing authorizes the selected
+package with a locally generated capability token.
 
 ## Scope and security
 
@@ -27,10 +28,8 @@ without an envelope remain compatible with v1. A present but malformed envelope,
 an unsupported required version, or missing required capabilities is rejected
 before dispatch. This addition does not change the encrypted network framing.
 
-Pairing records the selected music app's signing certificate and capability token.
-The music extension pins the Companion release certificate. Re-pair after upgrading
-from a development build that did not record a signer. A debug-signed Companion
-cannot substitute for the pinned release build.
+Pairing records the selected music app package and capability token. Re-pair after
+changing either selected package.
 
 Version 1.0.2 forwards participant next/previous requests through the authenticated
 host command path. Use it with the matching Jam patch update on both devices.
@@ -39,6 +38,19 @@ local playback on the participant.
 
 Release acceptance requires manual tests on two real devices with the exact patch
 build: pairing, queue revision convergence, stale edits, reconnect, Aware and LAN
-connections, signer rejection and invitation expiry. Unit tests and APK installation
+connections, package rejection and invitation expiry. Unit tests and APK installation
 alone do not satisfy this gate. The published custom source must also pass a clean
 Morphe Manager consumer test before the coordinated release is considered complete.
+
+## VPNs and local networking
+
+Jam Layer never process-binds the app away from a VPN. On Android versions that
+support it, it discovers services and opens LAN sockets on the physical Wi-Fi or
+Ethernet network explicitly; system routing is only a fallback for a VPN's own
+split-route policy.
+
+No special setup should normally be needed with a partial-tunnel VPN. If an
+exit-node or lockdown VPN blocks LAN access, enable that VPN's LAN-access option
+or exclude Jam Layer through its app split-tunneling controls. A non-bypassable
+Android VPN can intentionally prohibit local networking; Jam Layer reports that
+case rather than trying to defeat the policy.
