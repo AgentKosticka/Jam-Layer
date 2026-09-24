@@ -31,6 +31,7 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
   }
 
   private final NsdManager nsd;
+  private final Context context;
   private final LocalNetworkTracker tracker;
   private final String type;
   private final Listener listener;
@@ -45,6 +46,7 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
   private final Map<Long, Integer> discoveryFailures = new HashMap<>();
   private final Map<Long, Runnable> discoveryRetries = new HashMap<>();
   private final WifiManager.MulticastLock multicastLock;
+  private LanProbe.Browser probeBrowser;
   private boolean closed, legacyStarted;
 
   LanBrowser(
@@ -54,6 +56,7 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
     Listener listener
   ) {
     Context app = context.getApplicationContext();
+    this.context = app;
     nsd = app.getSystemService(NsdManager.class);
     this.tracker = tracker;
     this.type = type;
@@ -65,6 +68,14 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
   }
 
   void start() {
+    if (closed || probeBrowser != null) return;
+    probeBrowser = new LanProbe.Browser(
+      context,
+      tracker,
+      type,
+      listener::onEndpoint
+    );
+    probeBrowser.start();
     if (closed || nsd == null) {
       listener.onLanStatus("LAN discovery unavailable");
       return;
@@ -90,7 +101,7 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
         if (!discoveries.containsKey(handle)) startDiscovery(handle, network);
       }
       for (Long handle : new ArrayList<>(discoveries.keySet()))
-        if (!wanted.contains(handle)) stopDiscovery(handle);
+        if (handle != -1 && !wanted.contains(handle)) stopDiscovery(handle);
     });
   }
 
@@ -315,6 +326,7 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
   public void close() {
     closed = true;
     tracker.removeListener(this);
+    if (probeBrowser != null) probeBrowser.close();
     for (Runnable retry : discoveryRetries.values())
       handler.removeCallbacks(retry);
     discoveryRetries.clear();

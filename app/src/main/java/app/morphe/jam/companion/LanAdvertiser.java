@@ -28,6 +28,7 @@ final class LanAdvertiser
     new HashMap<>();
   private final Map<Long, Integer> registrationFailures = new HashMap<>();
   private final Map<Long, Runnable> registrationRetries = new HashMap<>();
+  private AutoCloseable probeRegistration;
   private boolean legacyRegistered, closed;
 
   LanAdvertiser(
@@ -51,7 +52,15 @@ final class LanAdvertiser
   }
 
   void start() {
-    if (closed || nsd == null) return;
+    if (closed || probeRegistration != null) return;
+    probeRegistration = LanProbe.advertise(
+      tracker,
+      type,
+      name,
+      port,
+      attributes
+    );
+    if (nsd == null) return;
     tracker.addListener(this);
   }
 
@@ -71,7 +80,7 @@ final class LanAdvertiser
         );
       }
       for (Long handle : new ArrayList<>(registrations.keySet()))
-        if (!wanted.contains(handle)) unregister(handle);
+        if (handle != -1 && !wanted.contains(handle)) unregister(handle);
     });
   }
 
@@ -172,6 +181,10 @@ final class LanAdvertiser
   public void close() {
     closed = true;
     tracker.removeListener(this);
+    if (probeRegistration != null) try {
+      probeRegistration.close();
+    } catch (Exception ignored) {}
+    probeRegistration = null;
     for (Runnable retry : registrationRetries.values())
       handler.removeCallbacks(retry);
     registrationRetries.clear();

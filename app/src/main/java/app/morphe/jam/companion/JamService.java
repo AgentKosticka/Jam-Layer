@@ -29,6 +29,7 @@ public final class JamService extends Service {
   private volatile IJamBridge bridge;
   private volatile Invitation invitation;
   private volatile SecureChannel channel;
+  private volatile String bleState = "idle";
   private volatile String role = "Idle",
     transport = "None",
     message = "Open Jam in YouTube Music to pair this layer.",
@@ -229,6 +230,7 @@ public final class JamService extends Service {
         .put("allowGuestEdits", allowGuestEdits)
         .put("lanState", lanState)
         .put("awareState", awareState)
+        .put("bleState", bleState)
         .put("vpnActive", vpnActive)
         .put("lanRoute", lanRoute)
         .put("transportRoute", lanRoute);
@@ -249,7 +251,7 @@ public final class JamService extends Service {
     role = "Joining";
     message = "Finding the code on nearby devices…";
     try {
-      CodePairing.Handoff handoff = CodePairing.find(this, code);
+      CodePairing.Handoff handoff = CodePairing.find(this, code, mode);
       if (epoch != sessionEpoch) {
         handoff.close();
         return error("Joining cancelled");
@@ -409,8 +411,10 @@ public final class JamService extends Service {
         "Promoted paired transport=" + pairedTransport + " route=" + route
       );
       Nearby discovery = nearby;
-      nearby = null;
-      if (discovery != null) discovery.close();
+      if (!"BLE".equals(pairedTransport)) {
+        nearby = null;
+        if (discovery != null) discovery.close();
+      } else if (discovery != null) discovery.pairedBleConnected();
       workers.execute(() -> sync(expected));
     } catch (Exception error) {
       android.util.Log.w("MorpheJam", "Paired host authentication failed", error);
@@ -479,8 +483,9 @@ public final class JamService extends Service {
   }
 
   private final Nearby.Listener listener = new Nearby.Listener() {
+    public void bleState(String state) { bleState = state; }
     public void status(String m) {
-      message = m;
+      if (channel == null) message = m;
       android.util.Log.i("MorpheJam", m);
     }
 
@@ -536,10 +541,13 @@ public final class JamService extends Service {
             sessionEpoch == epoch &&
             expected.valid() &&
             "Participant".equals(role) &&
-            channel == null &&
+            (channel == null || ("BLE".equals(transport) && !"BLE".equals(offered.transport()))) &&
             offered.accept()
           ) {
+            SecureChannel previous = channel;
             channel = authenticated;
+            if (previous != null) try { previous.close(); } catch (Exception ignored) {}
+            connections.removeIf(ChannelTransport::isClosed);
             connections.add(offered.connection());
             transport = displayTransport(offered);
             lanRoute = offered.route();
@@ -918,6 +926,7 @@ public final class JamService extends Service {
     lanRoute = "";
     lanState = "idle";
     awareState = "idle";
+    bleState = "idle";
     vpnActive = false;
     sharedQueue = null;
     allowGuestEdits = true;

@@ -163,6 +163,11 @@ public final class MainActivity extends Activity {
 
   private boolean permissions() {
     ArrayList<String> permissions = new ArrayList<>();
+    if (Build.VERSION.SDK_INT >= 31) {
+      permissions.add("android.permission.BLUETOOTH_SCAN");
+      permissions.add("android.permission.BLUETOOTH_CONNECT");
+      permissions.add("android.permission.BLUETOOTH_ADVERTISE");
+    }
     if (Build.VERSION.SDK_INT >= 33) {
       permissions.add("android.permission.NEARBY_WIFI_DEVICES");
       permissions.add("android.permission.POST_NOTIFICATIONS");

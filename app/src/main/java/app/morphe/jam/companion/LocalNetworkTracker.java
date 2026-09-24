@@ -201,6 +201,10 @@ final class LocalNetworkTracker implements AutoCloseable {
     }
   }
 
+  ConnectivityManager connectivity() {
+    return connectivity;
+  }
+
   private void refreshLocal(Network network) {
     refreshLocal(
       network,

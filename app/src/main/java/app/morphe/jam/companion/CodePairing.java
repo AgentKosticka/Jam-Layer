@@ -21,6 +21,7 @@ public final class CodePairing implements AutoCloseable {
 
     final String invitation, transport, route;
     private Socket socket;
+    private ChannelTransport direct;
     private AutoCloseable path;
 
     Handoff(
@@ -38,6 +39,23 @@ public final class CodePairing implements AutoCloseable {
     }
 
     synchronized ChannelTransport takeConnection() throws java.io.IOException {
+      if (direct != null) {
+        ChannelTransport value = direct;
+        AutoCloseable resource = path;
+        direct = null;
+        path = null;
+        return new ChannelTransport() {
+          public byte[] read(int max) throws java.io.IOException { return value.read(max); }
+          public void write(byte[] record) throws java.io.IOException { value.write(record); }
+          public void setReadTimeout(int ms) throws java.io.IOException { value.setReadTimeout(ms); }
+          public boolean isClosed() { return value.isClosed(); }
+          public void close() throws java.io.IOException {
+            try { value.close(); } finally {
+              if (resource != null) try { resource.close(); } catch (Exception ignored) {}
+            }
+          }
+        };
+      }
       if (socket == null) throw new java.io.IOException("Pairing connection closed");
       Socket value = socket;
       AutoCloseable resource = path;
@@ -53,6 +71,8 @@ public final class CodePairing implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+      if (direct != null) try { direct.close(); } catch (Exception ignored) {}
+      direct = null;
       Socket value = socket;
       AutoCloseable resource = path;
       socket = null;
@@ -81,6 +101,10 @@ public final class CodePairing implements AutoCloseable {
   private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
   private final HandoffListener handoffListener;
   private AwareCodePairing aware;
+  private BleNearby ble;
+  private final android.os.Handler bleHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+  private final java.util.concurrent.atomic.AtomicInteger bleAttempts = new java.util.concurrent.atomic.AtomicInteger();
+  private static final String BLE_PAIRING = "morphejam-pair-ble-v1";
   private volatile boolean closed;
 
   public CodePairing(Context context, Invitation invitation) throws Exception {
@@ -117,6 +141,31 @@ public final class CodePairing implements AutoCloseable {
       code,
       server.getLocalPort()
     );
+    ble = new BleNearby(this.context, BLE_PAIRING, true, new BleNearby.Listener() {
+      public void state(String state) {}
+      public void connected(ChannelTransport connection) {
+        if (!valid() || bleAttempts.incrementAndGet() > 32) {
+          try { connection.close(); } catch (Exception ignored) {}
+          return;
+        }
+        try { workers.execute(() -> {
+          boolean transferred = false;
+          try {
+            connection.write(invite.jamId.getBytes(StandardCharsets.UTF_8));
+            CodeExchange.giveAndKeep(connection, invite, code);
+            Handoff handoff = new Handoff(null, null, "BLE", "BLE_L2CAP", null);
+            handoff.direct = connection;
+            transferred = handoffListener != null && handoffListener.onHandoff(handoff);
+          } catch (Exception ignored) {
+          } finally {
+            if (!transferred) try { connection.close(); } catch (Exception ignored) {}
+          }
+        }); } catch (RejectedExecutionException stopped) {
+          try { connection.close(); } catch (Exception ignored) {}
+        }
+      }
+    });
+    bleHandler.postDelayed(() -> { if (!closed) ble.start(); }, 8000);
     workers.execute(() -> {
       int attempts = 0,
         inWindow = 0;
@@ -189,6 +238,8 @@ public final class CodePairing implements AutoCloseable {
   @Override
   public void close() {
     closed = true;
+    bleHandler.removeCallbacksAndMessages(null);
+    if (ble != null) ble.close();
     if (aware != null) aware.close();
     aware = null;
     advertiser.close();
@@ -205,13 +256,44 @@ public final class CodePairing implements AutoCloseable {
   }
 
   public static Handoff find(Context context, String entered) throws Exception {
+    return find(context, entered, "Auto");
+  }
+
+  static Handoff find(Context context, String entered, String mode) throws Exception {
     String code = CodeExchange.normalize(entered);
     Context app = context.getApplicationContext();
     LocalNetworkTracker topology = new LocalNetworkTracker(app);
     topology.start();
     ScheduledExecutorService worker = Executors.newScheduledThreadPool(3);
     CompletableFuture<Handoff> result = new CompletableFuture<>();
-    AwareCodePairing aware = AwareCodePairing.find(app, code, result);
+    BleNearby[] bleHolder = new BleNearby[1];
+    BleNearby ble = new BleNearby(app, BLE_PAIRING, false, new BleNearby.Listener() {
+      public void state(String state) {}
+      public void connected(ChannelTransport connection) {
+        try { worker.execute(() -> {
+          boolean transferred = false;
+          try {
+            connection.setReadTimeout(12000);
+            String jam = new String(connection.read(36), StandardCharsets.UTF_8);
+            if (!UUID.fromString(jam).toString().equals(jam)) throw new IllegalArgumentException("Session ID");
+            Handoff handoff = new Handoff(
+              CodeExchange.takeAndKeep(connection, jam, code), null, "BLE", "BLE_L2CAP", bleHolder[0]
+            );
+            handoff.direct = connection;
+            transferred = result.complete(handoff);
+          } catch (Exception ignored) {
+          } finally {
+            if (!transferred) try { connection.close(); } catch (Exception ignored) {}
+          }
+        }); } catch (RejectedExecutionException stopped) {
+          try { connection.close(); } catch (Exception ignored) {}
+        }
+      }
+    });
+    bleHolder[0] = ble;
+    if ("Auto".equals(mode) || "BLE".equals(mode))
+      worker.schedule(() -> { if (!result.isDone()) ble.start(); }, "BLE".equals(mode) ? 0 : 8, TimeUnit.SECONDS);
+    AwareCodePairing aware = "BLE".equals(mode) || "LAN".equals(mode) ? null : AwareCodePairing.find(app, code, result);
     Map<String, LanEndpoint> endpoints = new ConcurrentHashMap<>();
     Map<String, Integer> attempts = new ConcurrentHashMap<>();
     Set<Socket> sockets = ConcurrentHashMap.newKeySet();
@@ -301,7 +383,7 @@ public final class CodePairing implements AutoCloseable {
         }
       }
     );
-    browser.start();
+    if (!"BLE".equals(mode) && !"Aware".equals(mode)) browser.start();
     Handoff found = null;
     try {
       found = result.get(30, TimeUnit.SECONDS);
@@ -314,7 +396,8 @@ public final class CodePairing implements AutoCloseable {
       result.cancel(false);
       // An Aware data path belongs to the returned handoff. Closing its
       // discovery client here would tear down the freshly promoted socket.
-      if (found == null || !"Aware".equals(found.transport)) aware.close();
+      if (aware != null && (found == null || !"Aware".equals(found.transport))) aware.close();
+      if (found == null || !"BLE".equals(found.transport)) ble.close();
       browser.close();
       topology.close();
       for (Socket socket : sockets)

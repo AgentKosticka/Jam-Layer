@@ -17,6 +17,7 @@ public final class Nearby implements AutoCloseable {
     void status(String message);
 
     default void state(String lanState, String awareState, boolean vpnActive) {}
+    default void bleState(String state) {}
   }
 
   public static final class ConnectionCandidate implements AutoCloseable {
@@ -151,6 +152,9 @@ public final class Nearby implements AutoCloseable {
   private final Runnable checkAwareDiscovery = this::checkAwareDiscovery;
   private LanAdvertiser advertiser;
   private LanBrowser browser;
+  private BleNearby ble;
+  private boolean pairedBleActive;
+  private final Runnable startBle = this::startBle;
   private WifiAwareManager awareManager;
   private WifiAwareSession aware;
   private DiscoverySession session;
@@ -193,8 +197,42 @@ public final class Nearby implements AutoCloseable {
       if (closed) return;
       topology.start();
       topology.addListener(topologyListener);
-      if (!"Aware".equals(preference)) startLan();
-      if (!"LAN".equals(preference)) startAware();
+      if (!"Aware".equals(preference) && !"BLE".equals(preference)) startLan();
+      if (!"LAN".equals(preference) && !"BLE".equals(preference)) startAware();
+      scheduleBle();
+    });
+  }
+
+  private boolean strongWinner() {
+    return winner != null && !"BLE".equals(winner.transport());
+  }
+
+  private void scheduleBle() {
+    handler.removeCallbacks(startBle);
+    if ("Auto".equals(preference) || "BLE".equals(preference))
+      handler.postDelayed(startBle, "BLE".equals(preference) ? 0 : 8000);
+  }
+
+  private void startBle() {
+    if (closed || pairedBleActive || (!host && winner != null)) return;
+    if (ble == null) ble = new BleNearby(context, invite, host, new BleNearby.Listener() {
+      public void connected(ChannelTransport connection) {
+        handler.post(() -> deliver(new ConnectionCandidate(
+          Nearby.this, connection, "BLE", "BLE_L2CAP", 0, null, null
+        )));
+      }
+      public void state(String state) { listener.bleState(state); }
+    });
+    ble.start();
+  }
+
+  void pairedBleConnected() {
+    handler.post(() -> {
+      if (closed) return;
+      pairedBleActive = true;
+      handler.removeCallbacks(startBle);
+      if (ble != null) ble.suspend();
+      listener.bleState("connected");
     });
   }
 
@@ -305,7 +343,7 @@ public final class Nearby implements AutoCloseable {
 
   private void connectLan(LanEndpoint endpoint) {
     if (
-      closed || winner != null ||
+      closed || strongWinner() ||
       authenticationRetries.getOrDefault(endpoint.fingerprint, 0) > 3 ||
       lanConnecting.contains(endpoint.fingerprint)
     ) return;
@@ -320,12 +358,12 @@ public final class Nearby implements AutoCloseable {
           snapshot,
           5000
         );
-        if (closed || winner != null) {
+        if (closed || strongWinner()) {
           try { result.socket.close(); } catch (Exception ignored) {}
           return;
         }
         handler.post(() -> {
-          if (closed || winner != null) {
+          if (closed || strongWinner()) {
             try { result.socket.close(); } catch (Exception ignored) {}
             return;
           }
@@ -358,7 +396,7 @@ public final class Nearby implements AutoCloseable {
   }
 
   private void lanFailed(LanEndpoint endpoint, Exception error) {
-    if (closed || winner != null) return;
+    if (closed || strongWinner()) return;
     int attempt = lanRetries.getOrDefault(endpoint.fingerprint, 0) + 1;
     lanRetries.put(endpoint.fingerprint, attempt);
     boolean vpn = vpnActive();
@@ -438,13 +476,13 @@ public final class Nearby implements AutoCloseable {
   }
 
   private boolean canConnectAware(int generation) {
-    return activeAware(generation) && (host || winner == null);
+    return activeAware(generation) && (host || !strongWinner());
   }
 
   private void attachAware() {
     WifiAwareManager manager = awareManager;
     if (
-      closed || winner != null || attaching || aware != null || manager == null
+      closed || strongWinner() || attaching || aware != null || manager == null
     ) return;
     if (!manager.isAvailable()) {
       awareState = "unavailable; waiting";
@@ -606,14 +644,14 @@ public final class Nearby implements AutoCloseable {
   /** Some vendor stacks retain a subscribe session that no longer receives beacons. */
   private void checkAwareDiscovery() {
     if (
-      closed || host || winner != null || awarePeerSeen || session == null
+      closed || host || strongWinner() || awarePeerSeen || session == null
     ) return;
     restartAware(awareGeneration, "Aware discovery retrying");
   }
 
   private void scheduleAwareRetry() {
     handler.removeCallbacks(retryAware);
-    if (!closed && winner == null) handler.postDelayed(retryAware, 3000);
+    if (!closed && !strongWinner()) handler.postDelayed(retryAware, 3000);
   }
 
   private void sendAwareMessage(PeerHandle peer, String value, int generation) {
@@ -761,7 +799,8 @@ public final class Nearby implements AutoCloseable {
   }
 
   private void deliver(ConnectionCandidate candidate) {
-    if (closed || (!host && winner != null)) {
+    if (closed || (!host && winner != null &&
+        (strongWinner() || "BLE".equals(candidate.transport())))) {
       candidate.close();
       return;
     }
@@ -770,7 +809,8 @@ public final class Nearby implements AutoCloseable {
   }
 
   private synchronized boolean accept(ConnectionCandidate candidate) {
-    if (closed || (!host && winner != null && winner != candidate)) return false;
+    if (closed || (!host && winner != null && winner != candidate &&
+        (strongWinner() || "BLE".equals(candidate.transport())))) return false;
     if (!host) winner = candidate;
     handler.post(() -> finishAccepted(candidate));
     return true;
@@ -783,6 +823,10 @@ public final class Nearby implements AutoCloseable {
       return;
     }
     if (winner != candidate) return;
+    if (!"BLE".equals(candidate.transport())) {
+      handler.removeCallbacks(startBle);
+      if (ble != null) ble.suspend();
+    }
     for (ConnectionCandidate other : new ArrayList<>(candidates))
       if (other != candidate) other.close();
     lanState = "LAN".equals(candidate.transport()) ? "connected" : "cancelled";
@@ -819,10 +863,12 @@ public final class Nearby implements AutoCloseable {
       if (closed || host) return;
       ConnectionCandidate previous = winner;
       winner = null;
+      pairedBleActive = false;
       if (previous != null) previous.close();
       lanState = "reconnecting";
-      if (!"Aware".equals(preference) && browser == null) startLan();
-      if (!"LAN".equals(preference)) {
+      if (!"Aware".equals(preference) && !"BLE".equals(preference) && browser == null) startLan();
+      scheduleBle();
+      if (!"LAN".equals(preference) && !"BLE".equals(preference)) {
         // A failed Aware socket invalidates its data path and peer state on
         // several vendor implementations. Reattach in that case. A LAN loss
         // has no Aware path to invalidate, so it can use the warm peer handle.
@@ -859,7 +905,7 @@ public final class Nearby implements AutoCloseable {
             }
         return;
       }
-      if (closed || winner != null ||
+      if (closed || strongWinner() ||
           endpoints.get(endpoint.fingerprint) != endpoint) return;
       int count = authenticationRetries.getOrDefault(endpoint.fingerprint, 0) + 1;
       authenticationRetries.put(endpoint.fingerprint, count);
@@ -904,6 +950,8 @@ public final class Nearby implements AutoCloseable {
     closed = true;
     handler.post(() -> {
       topology.removeListener(topologyListener);
+      handler.removeCallbacks(startBle);
+      if (ble != null) ble.close();
       topology.close();
       if (advertiser != null) advertiser.close();
       advertiser = null;

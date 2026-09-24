@@ -49,6 +49,29 @@ support it, it discovers services and opens LAN sockets on the physical Wi-Fi or
 Ethernet network explicitly; system routing is only a fallback for a VPN's own
 split-route policy.
 
+For phone hotspots, LAN discovery also probes the Wi-Fi gateway and announces
+client-hosted Jams to it over UDP port 39547. This supports either device hosting
+when hotspot mDNS is unavailable. Both devices need a build with this fallback.
+Discovery carries only the service name, session ID and TCP port; the invitation
+secret or short code still authenticates the encrypted connection. Wi-Fi Aware
+may be unavailable while the hotspot is active; Auto can use LAN in that case.
+
+BLE is a low-priority fallback on Android 10 and newer. Auto gives LAN and Wi-Fi
+Aware an eight-second head start, uses low-power scanning and ultra-low-power
+advertising, and upgrades an authenticated BLE session when LAN or Aware becomes
+available. LE L2CAP carries the same encrypted records and short-code PAKE as LAN.
+No invitation secret or short-code hash is advertised.
+
+Android has no reliable public advertising/audio concurrency capability flag.
+Jam therefore conservatively stops BLE advertising, scanning and connections
+while any Bluetooth audio output is connected, and resumes when that route is
+removed. This includes A2DP, SCO, LE Audio and hearing aids. Unsupported hardware,
+disabled Bluetooth and missing permissions leave the other transports available.
+The automated `DeviceScenario` roles `blePolicy`, `recovery` with `transport=BLE`,
+and `bleUpgrade` cover policy teardown/resume, BLE reconnection and promotion to
+LAN. The audio-policy test injects the busy signal; it is not a headphone playback
+quality measurement.
+
 No special setup should normally be needed with a partial-tunnel VPN. If an
 exit-node or lockdown VPN blocks LAN access, enable that VPN's LAN-access option
 or exclude Jam Layer through its app split-tunneling controls. A non-bypassable

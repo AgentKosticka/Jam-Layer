@@ -29,6 +29,28 @@ public final class DeviceScenario extends Instrumentation {
             Thread.sleep(1200);context.startForegroundService(JamService.startIntent(context));
             for(int i=0;i<50&&JamService.active==null;i++)Thread.sleep(100);
             JamService s=JamService.active;check(s!=null,"Service unavailable");String mode=args.getString("transport","LAN");
+            if("blePolicy".equals(args.getString("role"))){
+                java.util.concurrent.atomic.AtomicBoolean blocked=new java.util.concurrent.atomic.AtomicBoolean(true);
+                java.util.concurrent.atomic.AtomicReference<String> status=new java.util.concurrent.atomic.AtomicReference<>("");
+                BleNearby radio=new BleNearby(context,"policy-test",true,new BleNearby.Listener(){
+                    public void connected(ChannelTransport connection){try{connection.close();}catch(Exception ignored){}}
+                    public void state(String state){status.set(state);}
+                },()->blocked.get()||BleNearby.bluetoothAudioConnected(context));
+                try{
+                    radio.start();for(int i=0;i<50&&!status.get().contains("paused for Bluetooth audio");i++)Thread.sleep(100);
+                    check(status.get().contains("paused for Bluetooth audio"),"Audio guard did not block BLE: "+status.get());
+                    if(!BleNearby.bluetoothAudioConnected(context)){
+                        blocked.set(false);radio.start();for(int i=0;i<100&&!status.get().startsWith("advertising;");i++)Thread.sleep(100);
+                        check(status.get().startsWith("advertising;"),"BLE did not resume: "+status.get());
+                        blocked.set(true);radio.start();for(int i=0;i<50&&!status.get().contains("paused for Bluetooth audio");i++)Thread.sleep(100);
+                        check(status.get().contains("paused for Bluetooth audio"),"Active BLE did not stand down");
+                    }
+                    java.lang.reflect.Field field=BleNearby.class.getDeclaredField("server");field.setAccessible(true);check(field.get(radio)==null,"BLE listener survived audio guard");
+                    field=BleNearby.class.getDeclaredField("advertising");field.setAccessible(true);check(field.get(radio)==null,"BLE advertising survived audio guard");
+                    note("PASS BLE audio policy: injected guard blocks and tears down radio; safe resume checked when no audio device connected");
+                }finally{radio.close();}
+                finish(Activity.RESULT_OK,result);return;
+            }
             if("bridge".equals(args.getString("role"))){
                 java.lang.reflect.Field field=JamService.class.getDeclaredField("bridge");field.setAccessible(true);
                 for(int i=0;i<50&&field.get(s)==null;i++)Thread.sleep(100);
@@ -56,14 +78,30 @@ public final class DeviceScenario extends Instrumentation {
                 result.putString("invite",s.invite());result.putString("code",invitation.getString("code"));
                  note("HOST_READY "+mode);
                 if ("true".equals(args.getString("hold"))) {
-                    for (int i=0;i<900&&s.invite().length()>0;i++) Thread.sleep(100);
+                    for (int i=0;i<900&&s.invite().length()>0;i++) {
+                        if(i==500&&"true".equals(args.getString("enableLanAfter"))){
+                            java.lang.reflect.Field field=JamService.class.getDeclaredField("nearby");field.setAccessible(true);Nearby nearby=(Nearby)field.get(s);
+                            java.lang.reflect.Method method=Nearby.class.getDeclaredMethod("startLan");method.setAccessible(true);
+                            runOnMainSync(()->{try{method.invoke(nearby);}catch(Exception e){throw new RuntimeException(e);}});note("LAN_ENABLED");
+                        }
+                        Thread.sleep(100);
+                    }
                 }
                 finish(Activity.RESULT_OK,result);return;
             }else{
                 if("code".equals(args.getString("join"))){String code=args.containsKey("code")?args.getString("code"):read(context.getFilesDir().toPath().resolve("test-code.txt"));check(s.dispatch(new JSONObject().put("op","JOIN").put("invite",code).put("transport",mode)).optBoolean("ok"),"Code join failed");}
                 else {String invite=args.containsKey("invite")?args.getString("invite"):read(context.getFilesDir().toPath().resolve("test-invite.txt"));s.join(invite,mode);}
-                for(int i=0;i<300&&!Arrays.asList("LAN","Aware","Nearby").contains(s.state().optString("transport"));i++)Thread.sleep(100);
-                note("STATE "+s.state());check(mode.equals(s.state().optString("transport"))||("Auto".equals(mode)&&Arrays.asList("LAN","Aware","Nearby").contains(s.state().optString("transport"))),"Requested transport not connected");
+                for(int i=0;i<450&&!Arrays.asList("LAN","Aware","Nearby","BLE").contains(s.state().optString("transport"));i++)Thread.sleep(100);
+                note("STATE "+s.state());check(mode.equals(s.state().optString("transport"))||("Auto".equals(mode)&&Arrays.asList("LAN","Aware","Nearby","BLE").contains(s.state().optString("transport"))),"Requested transport not connected");
+                if("bleUpgrade".equals(args.getString("role"))){
+                    check("BLE".equals(s.state().optString("transport")),"Expected BLE fallback first");
+                    JSONObject before=request(s,new JSONObject().put("op","SNAPSHOT"));check(before.optBoolean("ok"),"BLE snapshot failed");
+                    for(int i=0;i<450&&!"LAN".equals(s.state().optString("transport"));i++)Thread.sleep(100);
+                    check("LAN".equals(s.state().optString("transport")),"BLE did not yield to LAN: "+s.state());
+                    JSONObject after=request(s,new JSONObject().put("op","SNAPSHOT"));check(after.optBoolean("ok"),"LAN snapshot failed");
+                    check(before.getJSONArray("items").toString().equals(after.getJSONArray("items").toString()),"Upgrade changed queue");
+                    note("PASS BLE to LAN upgrade: authenticated faster transport, unchanged queue");finish(Activity.RESULT_OK,result);return;
+                }
                 if("recovery".equals(args.getString("role"))){
                     JSONObject before=request(s,new JSONObject().put("op","SNAPSHOT"));check(before.optBoolean("ok"),"Initial snapshot failed");
                     // Fault injection is confined to this separate instrumentation APK.
