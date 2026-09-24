@@ -30,7 +30,7 @@
     <application android:label="Jam Layer" android:icon="@mipmap/ic_jam" android:roundIcon="@mipmap/ic_jam" android:theme="@android:style/Theme.Material.NoActionBar" android:allowBackup="false" android:usesCleartextTraffic="false">
         <!-- Opened explicitly by YTM for permissions, pairing and scanning. -->
         <activity android:name=".MainActivity" android:exported="true" android:excludeFromRecents="true"/>
-        <activity android:name=".ScanActivity" android:exported="false"/>
+        <activity android:name=".ScanActivity" android:exported="false" android:screenOrientation="portrait" android:configChanges="orientation|screenSize"/>
         <service android:name=".JamService" android:exported="true" android:foregroundServiceType="connectedDevice"/>
     </application>
 </manifest>

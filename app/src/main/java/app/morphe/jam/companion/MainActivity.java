@@ -14,6 +14,8 @@ public final class MainActivity extends Activity {
   private final Handler handler = new Handler(Looper.getMainLooper());
   private TextView status;
   private boolean scanning;
+  private boolean scanStarted;
+  private String pendingInvite;
   private boolean finishAfterPermissions;
   private final Runnable refresh = new Runnable() {
     public void run() {
@@ -40,6 +42,8 @@ public final class MainActivity extends Activity {
   @Override
   public void onCreate(Bundle b) {
     super.onCreate(b);
+    scanStarted = b != null && b.getBoolean("scanStarted");
+    pendingInvite = b == null ? null : b.getString("pendingInvite");
     if ("app.morphe.jam.PAIR".equals(getIntent().getAction())) {
       pair();
       return;
@@ -60,6 +64,12 @@ public final class MainActivity extends Activity {
         finish();
         return;
       }
+      if (pendingInvite != null) {
+        joinWhenReady(pendingInvite, 20);
+        return;
+      }
+      // Android restores the outstanding activity result across recreation.
+      if (scanStarted) return;
       if (
         checkSelfPermission("android.permission.CAMERA") !=
         PackageManager.PERMISSION_GRANTED
@@ -193,7 +203,16 @@ public final class MainActivity extends Activity {
   }
 
   private void scan() {
+    if (scanStarted || isFinishing()) return;
+    scanStarted = true;
     startActivityForResult(new Intent(this, ScanActivity.class), 4);
+  }
+
+  @Override
+  protected void onSaveInstanceState(Bundle state) {
+    state.putBoolean("scanStarted", scanStarted);
+    state.putString("pendingInvite", pendingInvite);
+    super.onSaveInstanceState(state);
   }
 
   @Override
@@ -219,6 +238,7 @@ public final class MainActivity extends Activity {
         String invite = data.getStringExtra("invite");
         try {
           new Invitation(invite);
+          pendingInvite = invite;
           startForegroundService(JamService.startIntent(this));
           joinWhenReady(invite, 20);
         } catch (Exception e) {
@@ -255,7 +275,7 @@ public final class MainActivity extends Activity {
 
   @Override
   protected void onDestroy() {
-    handler.removeCallbacks(refresh);
+    handler.removeCallbacksAndMessages(null);
     super.onDestroy();
   }
 }

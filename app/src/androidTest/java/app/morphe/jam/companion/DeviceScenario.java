@@ -25,6 +25,18 @@ public final class DeviceScenario extends Instrumentation {
     @Override public void onStart(){
         Bundle result=new Bundle();
         try{
+            if ("scanFlow".equals(args.getString("role"))) {
+                ScanFlowScenario.run(this);
+                result.putString("stream", "SCAN_FLOW_OK one scanner across broker recreation and result delivery\n");
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
+            if ("camera".equals(args.getString("role"))) {
+                CameraScenario.run(this);
+                result.putString("stream", "CAMERA_OK focus, rotation, resume and QR completion\n");
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
             Context context=getTargetContext();context.startActivity(new Intent(context,MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
             Thread.sleep(1200);context.startForegroundService(JamService.startIntent(context));
             for(int i=0;i<50&&JamService.active==null;i++)Thread.sleep(100);
