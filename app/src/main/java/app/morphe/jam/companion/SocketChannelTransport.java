@@ -10,7 +10,7 @@ final class SocketChannelTransport implements ChannelTransport {
   private final DataInputStream input;
   private final DataOutputStream output;
   private final AutoCloseable path;
-  private boolean closed;
+  private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
   SocketChannelTransport(Socket socket) throws IOException {
     this(socket, null);
@@ -57,9 +57,9 @@ final class SocketChannelTransport implements ChannelTransport {
   }
 
   @Override
-  public synchronized void close() throws IOException {
-    if (closed) return;
-    closed = true;
+  public void close() throws IOException {
+    // Close must interrupt a blocked writer instead of waiting for its monitor.
+    if (!closed.compareAndSet(false, true)) return;
     IOException failure = null;
     try {
       socket.close();

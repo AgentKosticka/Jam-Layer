@@ -57,7 +57,7 @@ secret or short code still authenticates the encrypted connection. Wi-Fi Aware
 may be unavailable while the hotspot is active; Auto can use LAN in that case.
 
 BLE is a low-priority fallback on Android 10 and newer. Auto gives LAN and Wi-Fi
-Aware an eight-second head start, uses low-power scanning and ultra-low-power
+Aware a 1.5-second head start (none when Wi-Fi is off), uses low-power scanning and ultra-low-power
 advertising, and upgrades an authenticated BLE session when LAN or Aware becomes
 available. LE L2CAP carries the same encrypted records and short-code PAKE as LAN.
 No invitation secret or short-code hash is advertised.
@@ -77,3 +77,20 @@ exit-node or lockdown VPN blocks LAN access, enable that VPN's LAN-access option
 or exclude Jam Layer through its app split-tunneling controls. A non-bypassable
 Android VPN can intentionally prohibit local networking; Jam Layer reports that
 case rather than trying to defeat the policy.
+
+## Session lifecycle update
+
+Host, join and end responses include current session state for immediate player
+feedback. Leaving, cancelling a code lookup, expiry and failed hosting remove the
+foreground notification and release session resources. A bound idle bridge can
+remain available for the next tap, without a foreground notification or wake lock.
+Cancelling closes discovery promptly; delayed snapshots and transport callbacks
+cannot revive the ended session. Socket closure also interrupts blocked writes.
+
+Use the matching Jam patch update for pausing participant audio on join, leaving
+local audio paused on exit, Wi-Fi-off entry, BLE status, and translatable rejection
+of unsupported playlist/downloaded enqueue actions.
+
+Companion-only device tests live in `LayerScenario` (roles `layerLifecycle`,
+`layerHost`, `layerGuest`) and use a synthetic bridge, leaving YTM queues alone.
+They require a wiped, permission-granted debug companion and its separate test APK.

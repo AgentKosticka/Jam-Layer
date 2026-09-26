@@ -210,7 +210,17 @@ public final class Nearby implements AutoCloseable {
   private void scheduleBle() {
     handler.removeCallbacks(startBle);
     if ("Auto".equals(preference) || "BLE".equals(preference))
-      handler.postDelayed(startBle, "BLE".equals(preference) ? 0 : 8000);
+      handler.postDelayed(startBle, bleDelay(context, preference));
+  }
+
+  static long bleDelay(Context context, String mode) {
+    if ("BLE".equals(mode)) return 0;
+    android.net.wifi.WifiManager wifi = context.getApplicationContext()
+        .getSystemService(android.net.wifi.WifiManager.class);
+    // No reason to wait for Wi-Fi when it is switched off. Keep the existing
+    // audio-route guard and upgrade BLE when a faster transport authenticates.
+    if (wifi == null || !wifi.isWifiEnabled()) return 0;
+    return 1500;
   }
 
   private void startBle() {

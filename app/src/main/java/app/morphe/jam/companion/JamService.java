@@ -17,15 +17,20 @@ public final class JamService extends Service {
   private final ScheduledExecutorService monitor =
     Executors.newSingleThreadScheduledExecutor();
   private PowerManager.WakeLock wakeLock;
+  private final Handler main = new Handler(Looper.getMainLooper());
+  private final Object lifecycle = new Object();
+  private volatile FutureTask<CodePairing.Handoff> lookup;
+  private volatile boolean destroyed;
   private String selectedMode = "Auto";
   private volatile JSONObject sharedQueue;
   private volatile long discoveryStarted;
   private volatile boolean allowGuestEdits = true;
   private final Object serial = new Object(),
     connectionLock = new Object();
-  private final Map<String, String> completed = new HashMap<>(),
-    payloads = new HashMap<>();
-  private final Set<ChannelTransport> connections = ConcurrentHashMap.newKeySet();
+  private final Map<String, String> completed = new ConcurrentHashMap<>(),
+    payloads = new ConcurrentHashMap<>();
+  private final Set<ChannelTransport> connections =
+    ConcurrentHashMap.newKeySet();
   private volatile IJamBridge bridge;
   private volatile Invitation invitation;
   private volatile SecureChannel channel;
@@ -47,7 +52,7 @@ public final class JamService extends Service {
   private final ServiceConnection binding = new ServiceConnection() {
     public void onServiceConnected(ComponentName n, IBinder b) {
       bridge = IJamBridge.Stub.asInterface(b);
-      message = "YouTube Music connected";
+      if (invitation == null) message = "YouTube Music connected";
     }
 
     public void onServiceDisconnected(ComponentName n) {
@@ -61,7 +66,9 @@ public final class JamService extends Service {
         unbindService(this);
         bound = false;
       }
-      new Handler(getMainLooper()).postDelayed(() -> bindMusic(), 1000);
+      main.postDelayed(() -> {
+        if (!destroyed) bindMusic();
+      }, 1000);
     }
   };
 
@@ -122,8 +129,12 @@ public final class JamService extends Service {
         Invitation i = invitation;
         if (i == null) return;
         if (!i.valid()) {
-          end();
-          message = "Session expired";
+          synchronized (lifecycle) {
+            if (invitation == i) {
+              end();
+              message = "Session expired";
+            }
+          }
           return;
         }
         try {
@@ -216,7 +227,22 @@ public final class JamService extends Service {
       return START_NOT_STICKY;
     }
     bindMusic();
+    // A start may race with an immediate END or be used only for pairing.
+    // Keep the bound bridge warm, but never retain an idle foreground service.
+    main.postDelayed(() -> {
+      if ("Idle".equals(role)) finishForeground();
+    }, 1500);
     return START_NOT_STICKY;
+  }
+
+  private void finishForeground() {
+    main.post(() -> {
+      synchronized (lifecycle) {
+        if (!"Idle".equals(role)) return;
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
+      }
+    });
   }
 
   public JSONObject state() {
@@ -246,129 +272,179 @@ public final class JamService extends Service {
 
   public JSONObject joinCode(String code, String mode) throws Exception {
     CodeExchange.normalize(code);
-    end();
-    long epoch = sessionEpoch;
-    role = "Joining";
-    message = "Finding the code on nearby devices…";
+    final long epoch;
+    final FutureTask<CodePairing.Handoff> search =
+      new FutureTask<CodePairing.Handoff>(() ->
+        CodePairing.find(this, code, mode)
+      ) {
+        @Override
+        protected void set(CodePairing.Handoff value) {
+          synchronized (lifecycle) {
+            if (isCancelled()) value.close();
+            else super.set(value);
+          }
+        }
+      };
+    synchronized (lifecycle) {
+      resetSession();
+      epoch = sessionEpoch;
+      role = "Joining";
+      message = "Finding the code on nearby devices…";
+      lookup = search;
+      workers.execute(search);
+    }
     try {
-      CodePairing.Handoff handoff = CodePairing.find(this, code, mode);
-      if (epoch != sessionEpoch) {
-        handoff.close();
-        return error("Joining cancelled");
+      CodePairing.Handoff handoff = search.get();
+      synchronized (lifecycle) {
+        if (epoch != sessionEpoch) {
+          handoff.close();
+          return error("Joining cancelled");
+        }
+        lookup = null;
+        join(handoff.invitation, mode, handoff);
       }
-      join(handoff.invitation, mode, handoff);
-      return ok();
+      return view();
     } catch (Exception e) {
-      if (epoch == sessionEpoch) {
-        role = "Idle";
-        message = e.getMessage();
+      synchronized (lifecycle) {
+        if (epoch == sessionEpoch) {
+          end();
+          message =
+            e.getCause() == null ? e.getMessage() : e.getCause().getMessage();
+        }
       }
-      throw e;
+      return error(
+        e instanceof CancellationException ? "Joining cancelled" : message
+      );
+    } finally {
+      synchronized (lifecycle) {
+        if (lookup == search) lookup = null;
+      }
     }
   }
 
   public void host(String mode) {
-    end();
-    Invitation next = new Invitation();
-    invitation = next;
-    role = "Host";
-    selectedMode = mode;
-    transport = "Starting";
-    message = "Starting host";
-    wakeLock.acquire(12 * 60 * 60 * 1000L);
-    workers.execute(() -> {
-      try {
-        ServerSocket listening = new ServerSocket(0);
-        if (invitation != next || !next.valid()) {
-          listening.close();
-          return;
-        }
-        server = listening;
-        nearby = new Nearby(
-          this,
-          next,
-          true,
-          listening.getLocalPort(),
-          mode,
-          listener
-        );
-        nearby.start();
-        message = "Host ready; share the QR invitation";
-        synchronized (serial) {
-          snapshotHost(next);
-        }
-        while (invitation == next && next.valid()) {
-          Socket socket = listening.accept();
-          if (connections.size() >= 8) {
-            socket.close();
-            continue;
+    synchronized (lifecycle) {
+      resetSession();
+      Invitation next = new Invitation();
+      invitation = next;
+      role = "Host";
+      selectedMode = mode;
+      transport = "Starting";
+      message = "Starting host";
+      wakeLock.acquire(12 * 60 * 60 * 1000L);
+      workers.execute(() -> {
+        try {
+          ServerSocket listening = new ServerSocket(0);
+          if (invitation != next || !next.valid()) {
+            listening.close();
+            return;
           }
-          try {
-            ChannelTransport connection = new SocketChannelTransport(socket);
-            connections.add(connection);
-            workers.execute(() -> serve(connection, next, null));
-          } catch (Exception error) {
-            try { socket.close(); } catch (Exception ignored) {}
+          synchronized (lifecycle) {
+            if (invitation != next) {
+              listening.close();
+              return;
+            }
+            server = listening;
+            nearby = new Nearby(
+              this,
+              next,
+              true,
+              listening.getLocalPort(),
+              mode,
+              listenerFor(next)
+            );
+            nearby.start();
+            message = "Host ready; share the QR invitation";
+          }
+          // Discovery and accepts must not wait for a slow native queue snapshot.
+          while (invitation == next && next.valid()) {
+            Socket socket = listening.accept();
+            if (connections.size() >= 8) {
+              socket.close();
+              continue;
+            }
+            try {
+              ChannelTransport connection = new SocketChannelTransport(socket);
+              synchronized (lifecycle) {
+                if (invitation != next) {
+                  connection.close();
+                  continue;
+                }
+                connections.add(connection);
+              }
+              workers.execute(() -> serve(connection, next, null));
+            } catch (Exception error) {
+              try {
+                socket.close();
+              } catch (Exception ignored) {}
+            }
+          }
+        } catch (Exception e) {
+          synchronized (lifecycle) {
+            if (invitation == next) {
+              android.util.Log.e("MorpheJam", "Host failed", e);
+              end();
+              message = "Host stopped: " + e.getClass().getSimpleName();
+            }
           }
         }
-      } catch (Exception e) {
-        if (invitation == next) {
-          android.util.Log.e("MorpheJam", "Host failed", e);
-          message = "Host stopped: " + e.getClass().getSimpleName();
-        }
-      }
-    });
+      });
+    }
   }
 
   public void join(String value, String mode) {
     join(value, mode, null);
   }
 
-  private void join(
-    String value,
-    String mode,
-    CodePairing.Handoff handoff
-  ) {
-    final Invitation next = new Invitation(value);
-    end();
-    invitation = next;
-    role = "Participant";
-    selectedMode = mode;
-    transport = "Connecting";
-    wakeLock.acquire(Math.max(1, next.expires - System.currentTimeMillis()));
-    boolean reusePairing = handoff != null && (
-      "Auto".equals(mode) || mode.equals(handoff.transport)
-    );
-    if (!reusePairing && handoff != null) handoff.close();
-    message = reusePairing ? "Authenticating paired host" : "Discovering host";
-    discoveryStarted = System.currentTimeMillis();
-    nearby = new Nearby(this, next, false, 0, mode, listener);
-    nearby.start();
-    if (reusePairing) {
-      ChannelTransport connection = null;
-      try {
-        connection = handoff.takeConnection();
-        // Register before handing the connection to a worker so end() can close
-        // it if the user cancels during the Jam handshake.
-        connections.add(connection);
-        ChannelTransport direct = connection;
-        workers.execute(
-          () -> authenticatePairedHost(
-            next,
-            direct,
-            handoff.transport,
-            handoff.route
-          )
-        );
-      } catch (Exception error) {
-        if (connection != null) {
-          connections.remove(connection);
-          try {
-            connection.close();
-          } catch (Exception ignored) {}
+  private void join(String value, String mode, CodePairing.Handoff handoff) {
+    synchronized (lifecycle) {
+      final Invitation next = new Invitation(value);
+      resetSession();
+      invitation = next;
+      role = "Participant";
+      selectedMode = mode;
+      transport = "Connecting";
+      wakeLock.acquire(Math.max(1, next.expires - System.currentTimeMillis()));
+      boolean reusePairing =
+        handoff != null &&
+        ("Auto".equals(mode) || mode.equals(handoff.transport));
+      if (!reusePairing && handoff != null) handoff.close();
+      message = reusePairing
+        ? "Authenticating paired host"
+        : "Discovering host";
+      discoveryStarted = System.currentTimeMillis();
+      nearby = new Nearby(this, next, false, 0, mode, listenerFor(next));
+      nearby.start();
+      if (reusePairing) {
+        ChannelTransport connection = null;
+        try {
+          connection = handoff.takeConnection();
+          // Register before handing the connection to a worker so end() can close
+          // it if the user cancels during the Jam handshake.
+          connections.add(connection);
+          ChannelTransport direct = connection;
+          workers.execute(() ->
+            authenticatePairedHost(
+              next,
+              direct,
+              handoff.transport,
+              handoff.route
+            )
+          );
+        } catch (Exception error) {
+          if (connection != null) {
+            connections.remove(connection);
+            try {
+              connection.close();
+            } catch (Exception ignored) {}
+          }
+          handoff.close();
+          android.util.Log.w(
+            "MorpheJam",
+            "Paired connection unavailable",
+            error
+          );
         }
-        handoff.close();
-        android.util.Log.w("MorpheJam", "Paired connection unavailable", error);
       }
     }
   }
@@ -391,18 +467,20 @@ public final class JamService extends Service {
         identity
       );
       synchronized (connectionLock) {
-        if (
-          invitation == expected &&
-          expected.valid() &&
-          "Participant".equals(role) &&
-          channel == null
-        ) {
-          channel = authenticated;
-          connections.add(connection);
-          transport = pairedTransport;
-          lanRoute = route;
-          message = "Authenticated host connected";
-          won = true;
+        synchronized (lifecycle) {
+          if (
+            invitation == expected &&
+            expected.valid() &&
+            "Participant".equals(role) &&
+            channel == null
+          ) {
+            channel = authenticated;
+            connections.add(connection);
+            transport = pairedTransport;
+            lanRoute = route;
+            message = "Authenticated host connected";
+            won = true;
+          }
         }
       }
       if (!won) return;
@@ -410,14 +488,21 @@ public final class JamService extends Service {
         "MorpheJam",
         "Promoted paired transport=" + pairedTransport + " route=" + route
       );
-      Nearby discovery = nearby;
-      if (!"BLE".equals(pairedTransport)) {
-        nearby = null;
-        if (discovery != null) discovery.close();
-      } else if (discovery != null) discovery.pairedBleConnected();
+      synchronized (lifecycle) {
+        if (invitation != expected) return;
+        Nearby discovery = nearby;
+        if (!"BLE".equals(pairedTransport)) {
+          nearby = null;
+          if (discovery != null) discovery.close();
+        } else if (discovery != null) discovery.pairedBleConnected();
+      }
       workers.execute(() -> sync(expected));
     } catch (Exception error) {
-      android.util.Log.w("MorpheJam", "Paired host authentication failed", error);
+      android.util.Log.w(
+        "MorpheJam",
+        "Paired host authentication failed",
+        error
+      );
     } finally {
       if (!won) {
         if (authenticated != null) try {
@@ -435,28 +520,30 @@ public final class JamService extends Service {
     Invitation expected,
     CodePairing.Handoff handoff
   ) {
-    if (
-      invitation != expected ||
-      !"Host".equals(role) ||
-      connections.size() >= 8
-    ) {
-      handoff.close();
-      return false;
-    }
-    try {
-      ChannelTransport connection = handoff.takeConnection();
-      connections.add(connection);
-      transport = handoff.transport;
-      lanRoute = handoff.route;
-      workers.execute(() -> serve(connection, expected, null));
-      android.util.Log.i(
-        "MorpheJam",
-        "Promoted paired participant transport=" + handoff.transport
-      );
-      return true;
-    } catch (Exception error) {
-      handoff.close();
-      return false;
+    synchronized (lifecycle) {
+      if (
+        invitation != expected ||
+        !"Host".equals(role) ||
+        connections.size() >= 8
+      ) {
+        handoff.close();
+        return false;
+      }
+      try {
+        ChannelTransport connection = handoff.takeConnection();
+        connections.add(connection);
+        transport = handoff.transport;
+        lanRoute = handoff.route;
+        workers.execute(() -> serve(connection, expected, null));
+        android.util.Log.i(
+          "MorpheJam",
+          "Promoted paired participant transport=" + handoff.transport
+        );
+        return true;
+      } catch (Exception error) {
+        handoff.close();
+        return false;
+      }
     }
   }
 
@@ -466,15 +553,24 @@ public final class JamService extends Service {
     reconnectScheduled = true;
     monitor.schedule(
       () -> {
-        if (sessionEpoch != epoch) return;
-        reconnectScheduled = false;
-        if (
-          invitation != expected || sessionEpoch != epoch || channel != null
-        ) return;
-        if (nearby != null) nearby.resume();
-        else {
-          nearby = new Nearby(this, expected, false, 0, selectedMode, listener);
-          nearby.start();
+        synchronized (lifecycle) {
+          if (sessionEpoch != epoch) return;
+          reconnectScheduled = false;
+          if (
+            invitation != expected || sessionEpoch != epoch || channel != null
+          ) return;
+          if (nearby != null) nearby.resume();
+          else {
+            nearby = new Nearby(
+              this,
+              expected,
+              false,
+              0,
+              selectedMode,
+              listenerFor(expected)
+            );
+            nearby.start();
+          }
         }
       },
       500,
@@ -482,8 +578,40 @@ public final class JamService extends Service {
     );
   }
 
+  private Nearby.Listener listenerFor(Invitation session) {
+    return new Nearby.Listener() {
+      public void bleState(String state) {
+        synchronized (lifecycle) {
+          if (invitation == session) listener.bleState(state);
+        }
+      }
+
+      public void status(String state) {
+        synchronized (lifecycle) {
+          if (invitation == session) listener.status(state);
+        }
+      }
+
+      public void state(String lan, String aware, boolean vpn) {
+        synchronized (lifecycle) {
+          if (invitation == session) listener.state(lan, aware, vpn);
+        }
+      }
+
+      public void connect(Nearby.ConnectionCandidate candidate) {
+        synchronized (lifecycle) {
+          if (invitation == session) listener.connect(candidate);
+          else candidate.reject();
+        }
+      }
+    };
+  }
+
   private final Nearby.Listener listener = new Nearby.Listener() {
-    public void bleState(String state) { bleState = state; }
+    public void bleState(String state) {
+      bleState = state;
+    }
+
     public void status(String m) {
       if (channel == null) message = m;
       android.util.Log.i("MorpheJam", m);
@@ -498,9 +626,7 @@ public final class JamService extends Service {
     public void connect(Nearby.ConnectionCandidate offered) {
       final Invitation expected = invitation;
       final long epoch = sessionEpoch;
-      if (
-        expected == null || !expected.valid()
-      ) {
+      if (expected == null || !expected.valid()) {
         offered.reject();
         return;
       }
@@ -536,30 +662,36 @@ public final class JamService extends Service {
         }
         boolean won = false;
         synchronized (connectionLock) {
-          if (
-            invitation == expected &&
-            sessionEpoch == epoch &&
-            expected.valid() &&
-            "Participant".equals(role) &&
-            (channel == null || ("BLE".equals(transport) && !"BLE".equals(offered.transport()))) &&
-            offered.accept()
-          ) {
-            SecureChannel previous = channel;
-            channel = authenticated;
-            if (previous != null) try { previous.close(); } catch (Exception ignored) {}
-            connections.removeIf(ChannelTransport::isClosed);
-            connections.add(offered.connection());
-            transport = displayTransport(offered);
-            lanRoute = offered.route();
-            message = "Authenticated host connected";
-            won = true;
-            android.util.Log.i(
-              "MorpheJam",
-              "Authenticated transport=" +
-                offered.transport() +
-                " route=" +
-                offered.route()
-            );
+          synchronized (lifecycle) {
+            if (
+              invitation == expected &&
+              sessionEpoch == epoch &&
+              expected.valid() &&
+              "Participant".equals(role) &&
+              (channel == null ||
+                ("BLE".equals(transport) &&
+                  !"BLE".equals(offered.transport()))) &&
+              offered.accept()
+            ) {
+              SecureChannel previous = channel;
+              channel = authenticated;
+              if (previous != null) try {
+                previous.close();
+              } catch (Exception ignored) {}
+              connections.removeIf(ChannelTransport::isClosed);
+              connections.add(offered.connection());
+              transport = displayTransport(offered);
+              lanRoute = offered.route();
+              message = "Authenticated host connected";
+              won = true;
+              android.util.Log.i(
+                "MorpheJam",
+                "Authenticated transport=" +
+                  offered.transport() +
+                  " route=" +
+                  offered.route()
+              );
+            }
           }
         }
         if (!won) {
@@ -576,7 +708,9 @@ public final class JamService extends Service {
 
   /** Existing music patches recognize LAN and Aware; the route retains the precise medium. */
   private static String displayTransport(Nearby.ConnectionCandidate candidate) {
-    return "Nearby".equals(candidate.transport()) ? "Aware" : candidate.transport();
+    return "Nearby".equals(candidate.transport())
+      ? "Aware"
+      : candidate.transport();
   }
 
   private void serve(
@@ -593,14 +727,17 @@ public final class JamService extends Service {
         null
       )
     ) {
-      if (offered != null && !offered.accept()) return;
-      if (offered != null) {
-        connections.add(connection);
-        transport = displayTransport(offered);
-        lanRoute = offered.route();
+      synchronized (lifecycle) {
+        if (invitation != session) return;
+        if (offered != null && !offered.accept()) return;
+        if (offered != null) {
+          connections.add(connection);
+          transport = displayTransport(offered);
+          lanRoute = offered.route();
+        }
+        android.util.Log.i("MorpheJam", "Authenticated participant");
+        message = "Participant authenticated";
       }
-      android.util.Log.i("MorpheJam", "Authenticated participant");
-      message = "Participant authenticated";
       while (invitation == session && session.valid()) {
         String request = peer.receive();
         JSONObject command = new JSONObject(request);
@@ -654,7 +791,7 @@ public final class JamService extends Service {
           peer.send(error("Unsupported operation").toString());
           continue;
         }
-        peer.send(hostCall(command, peer.clientId).toString());
+        peer.send(hostCall(command, peer.clientId, session).toString());
       }
     } catch (Exception e) {
       android.util.Log.i(
@@ -670,11 +807,17 @@ public final class JamService extends Service {
     }
   }
 
-  private JSONObject hostCall(JSONObject request, String client)
-    throws Exception {
+  private JSONObject hostCall(
+    JSONObject request,
+    String client,
+    Invitation expected
+  ) throws Exception {
     synchronized (serial) {
+      if (expected == null || invitation != expected) return error(
+        "Jam session ended"
+      );
       String op = request.optString("op");
-      if ("SNAPSHOT".equals(op)) return snapshotHost(invitation);
+      if ("SNAPSHOT".equals(op)) return snapshotHost(expected);
       if (!identity.equals(client) && !allowGuestEdits) return error(
         "The host has locked guest edits"
       );
@@ -682,11 +825,14 @@ public final class JamService extends Service {
       if (!UUID.fromString(id).toString().equals(id)) return error(
         "Invalid command id"
       );
-      String key = client + ":" + id,
+      String key = expected.jamId + ":" + client + ":" + id,
         body = request.toString();
       if (payloads.containsKey(key)) {
         if (!payloads.get(key).equals(body)) return error("Command id reused");
-        return new JSONObject(completed.get(key));
+        String result = completed.get(key);
+        return result == null
+          ? error("Jam session ended")
+          : new JSONObject(result);
       }
       if (payloads.size() >= 4096) return error(
         "Session command limit reached; start a new session"
@@ -698,9 +844,12 @@ public final class JamService extends Service {
       } catch (Exception e) {
         response = error("Outcome unknown; refresh queue before another edit");
       }
-      if (response.optBoolean("ok") && response.has("items")) sharedQueue =
-        response;
-      completed.put(key, response.toString());
+      synchronized (lifecycle) {
+        if (invitation != expected) return error("Jam session ended");
+        if (response.optBoolean("ok") && response.has("items")) sharedQueue =
+          response;
+        completed.put(key, response.toString());
+      }
       return response;
     }
   }
@@ -726,7 +875,12 @@ public final class JamService extends Service {
     try {
       JSONObject value = music(new JSONObject().put("op", "SNAPSHOT"));
       if (value.optBoolean("ok") && value.has("items")) {
-        sharedQueue = value;
+        synchronized (lifecycle) {
+          if (invitation != expected || expected == null) return error(
+            "Jam session ended"
+          );
+          sharedQueue = value;
+        }
         return value;
       }
       String failure = value.optString("error", "Host queue is unavailable");
@@ -759,7 +913,9 @@ public final class JamService extends Service {
       );
       if (!value.optBoolean("ok") && !value.optBoolean("unchanged")) {
         String failure = value.optString("error");
-        if (!failure.isEmpty()) message = failure;
+        synchronized (lifecycle) {
+          if (invitation == expected && !failure.isEmpty()) message = failure;
+        }
       }
     } catch (Exception e) {
       android.util.Log.w("MorpheJam", "Host sync failed", e);
@@ -771,7 +927,7 @@ public final class JamService extends Service {
     if ("STATE".equals(request.optString("op"))) return state();
     if ("HOST".equals(request.optString("op"))) {
       host(request.optString("transport", "Auto"));
-      return ok();
+      return view();
     }
     if ("JOIN".equals(request.optString("op"))) {
       String value = request.getString("invite").trim();
@@ -780,7 +936,7 @@ public final class JamService extends Service {
         request.optString("transport", "Auto")
       );
       join(value, request.optString("transport", "Auto"));
-      return ok();
+      return view();
     }
     if ("INVITE".equals(request.optString("op"))) {
       String value = invite();
@@ -797,11 +953,11 @@ public final class JamService extends Service {
         600,
         android.graphics.Bitmap.Config.ARGB_8888
       );
-      for (int y = 0; y < 600; y++) for (
-        int x = 0;
-        x < 600;
-        x++
-      ) bitmap.setPixel(x, y, bits.get(x, y) ? 0xff000000 : 0xffffffff);
+      int[] pixels = new int[600 * 600];
+      for (int y = 0; y < 600; y++) for (int x = 0; x < 600; x++) pixels[
+        y * 600 + x
+      ] = bits.get(x, y) ? 0xff000000 : 0xffffffff;
+      bitmap.setPixels(pixels, 0, 600, 0, 0, 600, 600);
       java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
       bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, bytes);
       bitmap.recycle();
@@ -814,15 +970,14 @@ public final class JamService extends Service {
             android.util.Base64.NO_WRAP
           )
         );
-      synchronized (serial) {
+      synchronized (lifecycle) {
         try {
+          if (!value.equals(invite())) return error("Jam session ended");
           if (codePairing == null || !codePairing.valid()) {
             if (codePairing != null) codePairing.close();
             Invitation expected = invitation;
-            codePairing = new CodePairing(
-              this,
-              expected,
-              handoff -> acceptPairedParticipant(expected, handoff)
+            codePairing = new CodePairing(this, expected, handoff ->
+              acceptPairedParticipant(expected, handoff)
             );
           }
           reply
@@ -838,16 +993,7 @@ public final class JamService extends Service {
       return reply;
     }
     if ("VIEW".equals(request.optString("op"))) {
-      JSONObject view =
-        sharedQueue == null
-          ? error(
-              "Participant".equals(role) &&
-                !"Authenticated host connected".equals(message)
-                ? message
-                : "Waiting for the host queue"
-            )
-          : new JSONObject(sharedQueue.toString());
-      return view.put("session", state());
+      return view();
     }
     if ("GUEST_EDITS".equals(request.optString("op"))) {
       if (!"Host".equals(role)) return error(
@@ -858,24 +1004,26 @@ public final class JamService extends Service {
     }
     if ("END".equals(request.optString("op"))) {
       end();
-      return ok();
+      return view();
     }
     Invitation current = invitation;
     if (current == null || !current.valid()) return error(
       "No active Jam session"
     );
-    if ("Host".equals(role)) return hostCall(request, identity);
+    if ("Host".equals(role)) return hostCall(request, identity, current);
     synchronized (connectionLock) {
-      if (channel == null) return error("Host is not connected");
+      final SecureChannel activeChannel = channel;
+      if (invitation != current) return error("Jam session ended");
+      if (activeChannel == null) return error("Host is not connected");
       try {
         // Queue synchronization is a heartbeat. Detect a dead route promptly;
         // leave longer native queue edits their existing completion budget.
-        channel.setReadTimeout(
+        activeChannel.setReadTimeout(
           "SYNC".equals(request.optString("op")) ? 8000 : 45000
         );
         long sent = SystemClock.elapsedRealtime();
-        channel.send(request.toString());
-        JSONObject value = new JSONObject(channel.receive());
+        activeChannel.send(request.toString());
+        JSONObject value = new JSONObject(activeChannel.receive());
         JSONObject clock = value.optJSONObject("clock");
         if (clock != null) clock
           .put("receivedAt", SystemClock.elapsedRealtime())
@@ -886,35 +1034,74 @@ public final class JamService extends Service {
               clock.optLong("age") + (SystemClock.elapsedRealtime() - sent) / 2
             )
           );
-        if (value.optBoolean("ok") && value.has("items")) sharedQueue = value;
-        else if (
-          value.optBoolean("unchanged") &&
-          value.has("clock") &&
-          sharedQueue != null
-        ) {
-          JSONObject copy = new JSONObject(sharedQueue.toString());
-          copy.put("clock", value.getJSONObject("clock"));
-          sharedQueue = copy;
+        synchronized (lifecycle) {
+          if (invitation != current) return error("Jam session ended");
+          if (value.optBoolean("ok") && value.has("items")) sharedQueue = value;
+          else if (
+            value.optBoolean("unchanged") &&
+            value.has("clock") &&
+            sharedQueue != null
+          ) {
+            JSONObject copy = new JSONObject(sharedQueue.toString());
+            copy.put("clock", value.getJSONObject("clock"));
+            sharedQueue = copy;
+          }
         }
         return value;
       } catch (Exception e) {
-        android.util.Log.w("MorpheJam", "Host channel failed", e);
-        try {
-          channel.close();
-        } catch (Exception ignored) {}
-        channel = null;
-        connections.removeIf(ChannelTransport::isClosed);
-        transport = "Disconnected";
-        message = "Reconnecting to host";
-        reconnect(current);
-        return error("Outcome unknown; refresh before editing. Reconnecting.");
+        synchronized (lifecycle) {
+          if (invitation != current) return error("Jam session ended");
+          android.util.Log.w("MorpheJam", "Host channel failed", e);
+          try {
+            activeChannel.close();
+          } catch (Exception ignored) {}
+          channel = null;
+          connections.removeIf(ChannelTransport::isClosed);
+          transport = "Disconnected";
+          message = "Reconnecting to host";
+          reconnect(current);
+          return error(
+            "Outcome unknown; refresh before editing. Reconnecting."
+          );
+        }
       }
     }
   }
 
   public void end() {
+    synchronized (lifecycle) {
+      resetSession();
+      message = "Start or join a Jam from YouTube Music";
+      finishForeground();
+    }
+  }
+
+  private JSONObject view() throws JSONException {
+    synchronized (lifecycle) {
+      JSONObject queue = sharedQueue;
+      JSONObject value =
+        queue == null ? ok() : new JSONObject(queue.toString());
+      if (queue == null && "Participant".equals(role)) value.put(
+        "error",
+        message
+      );
+      return value.put("session", state());
+    }
+  }
+
+  // Called with lifecycle held. Do not acquire serial/connectionLock here:
+  // closing the transports interrupts blocked reads without delaying Leave.
+  private void resetSession() {
     sessionEpoch++;
     reconnectScheduled = false;
+    FutureTask<CodePairing.Handoff> search = lookup;
+    lookup = null;
+    if (search != null) {
+      if (search.isDone() && !search.isCancelled()) try {
+        search.get().close();
+      } catch (Exception ignored) {}
+      search.cancel(true);
+    }
     if (codePairing != null) {
       codePairing.close();
       codePairing = null;
@@ -943,23 +1130,22 @@ public final class JamService extends Service {
         connection.close();
       } catch (Exception ignored) {}
     connections.clear();
-    synchronized (connectionLock) {
-      if (channel != null) try {
-        channel.close();
-      } catch (Exception ignored) {}
-      channel = null;
-    }
-    synchronized (serial) {
-      completed.clear();
-      payloads.clear();
-    }
+    SecureChannel oldChannel = channel;
+    channel = null;
+    if (oldChannel != null) try {
+      oldChannel.close();
+    } catch (Exception ignored) {}
+    completed.clear();
+    payloads.clear();
     if (old != null) old.destroy();
     if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
   }
 
   @Override
   public void onDestroy() {
+    destroyed = true;
     end();
+    main.removeCallbacksAndMessages(null);
     if (bound) unbindService(binding);
     workers.shutdownNow();
     monitor.shutdownNow();

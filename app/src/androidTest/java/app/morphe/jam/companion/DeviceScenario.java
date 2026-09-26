@@ -25,6 +25,12 @@ public final class DeviceScenario extends Instrumentation {
     @Override public void onStart(){
         Bundle result=new Bundle();
         try{
+            if (args.getString("role", "").startsWith("layer")) {
+                LayerScenario.run(this, args);
+                result.putString("stream", "LAYER_OK\n");
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
             if ("scanFlow".equals(args.getString("role"))) {
                 ScanFlowScenario.run(this);
                 result.putString("stream", "SCAN_FLOW_OK one scanner across broker recreation and result delivery\n");

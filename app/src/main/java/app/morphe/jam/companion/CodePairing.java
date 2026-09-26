@@ -165,7 +165,7 @@ public final class CodePairing implements AutoCloseable {
         }
       }
     });
-    bleHandler.postDelayed(() -> { if (!closed) ble.start(); }, 8000);
+    bleHandler.postDelayed(() -> { if (!closed) ble.start(); }, Nearby.bleDelay(this.context, "Auto"));
     workers.execute(() -> {
       int attempts = 0,
         inWindow = 0;
@@ -292,7 +292,7 @@ public final class CodePairing implements AutoCloseable {
     });
     bleHolder[0] = ble;
     if ("Auto".equals(mode) || "BLE".equals(mode))
-      worker.schedule(() -> { if (!result.isDone()) ble.start(); }, "BLE".equals(mode) ? 0 : 8, TimeUnit.SECONDS);
+      worker.schedule(() -> { if (!result.isDone()) ble.start(); }, Nearby.bleDelay(app, mode), TimeUnit.MILLISECONDS);
     AwareCodePairing aware = "BLE".equals(mode) || "LAN".equals(mode) ? null : AwareCodePairing.find(app, code, result);
     Map<String, LanEndpoint> endpoints = new ConcurrentHashMap<>();
     Map<String, Integer> attempts = new ConcurrentHashMap<>();
@@ -394,6 +394,11 @@ public final class CodePairing implements AutoCloseable {
       );
     } finally {
       result.cancel(false);
+      // Cancellation can race with an authenticated handoff winning the future.
+      if (found == null && !result.isCancelled() && !result.isCompletedExceptionally()) {
+        Handoff abandoned = result.getNow(null);
+        if (abandoned != null) abandoned.close();
+      }
       // An Aware data path belongs to the returned handoff. Closing its
       // discovery client here would tear down the freshly promoted socket.
       if (aware != null && (found == null || !"Aware".equals(found.transport))) aware.close();
