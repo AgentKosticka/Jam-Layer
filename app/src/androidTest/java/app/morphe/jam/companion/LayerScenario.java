@@ -95,10 +95,14 @@ final class LayerScenario {
 
   static void run(Instrumentation test, Bundle args) throws Exception {
     Context context = test.getTargetContext();
-    android.content.SharedPreferences.Editor controls = context
-      .getSharedPreferences("transport-test", 0)
-      .edit()
-      .clear();
+    TransportOptions.resetForTest();
+    // Legacy persistent overrides must never suppress normal discovery again.
+    context.getSharedPreferences("transport-test", 0).edit()
+      .putBoolean("disableAware", true).putBoolean("disableBle", true).commit();
+    check(!TransportOptions.disabled(context, "Aware") &&
+      !TransportOptions.disabled(context, "Ble"), "Persistent transport overrides leaked");
+    context.getSharedPreferences("transport-test", 0).edit().clear().commit();
+    java.util.Set<String> disabled = new java.util.HashSet<>();
     for (String provider : new String[] {
       "InviteHints",
       "Nsd",
@@ -109,16 +113,9 @@ final class LayerScenario {
       "Aware",
       "Ble",
     })
-      controls.putBoolean(
-        "disable" + provider,
-        "true".equals(args.getString("disable" + provider))
-      );
-    controls
-      .putInt(
-        "activeProbeDelayMs",
-        Integer.parseInt(args.getString("activeProbeDelayMs", "2000"))
-      )
-      .commit();
+      if ("true".equals(args.getString("disable" + provider))) disabled.add(provider);
+    TransportOptions.configureForTest(context, disabled,
+      Integer.parseInt(args.getString("activeProbeDelayMs", "2000")));
     // Wiped test installation has no user pairing. Supply only a temporary start capability.
     check(
       !context.getSharedPreferences("pair", 0).contains("package"),
@@ -457,6 +454,7 @@ final class LayerScenario {
       tasks.shutdownNow();
       context.unbindService(binding);
       context.getSharedPreferences("pair", 0).edit().clear().commit();
+      TransportOptions.resetForTest();
     }
   }
 }

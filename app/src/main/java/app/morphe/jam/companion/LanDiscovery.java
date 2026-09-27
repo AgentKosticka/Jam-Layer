@@ -19,6 +19,8 @@ final class LanDiscovery
   private final LocalNetworkTracker tracker;
   private final String jam;
   private final int hostPort;
+  private final boolean pairing;
+  private final int discoveryPort;
   private final BooleanSupplier connected;
   private final Consumer<LanEndpoint> listener;
   private final Handler handler = new Handler(Looper.getMainLooper());
@@ -36,12 +38,26 @@ final class LanDiscovery
     BooleanSupplier connected,
     Consumer<LanEndpoint> listener
   ) {
+    this(context, tracker, jam, hostPort, connected, listener, false);
+  }
+
+  static LanDiscovery pairing(Context context, LocalNetworkTracker tracker,
+    String jam, int hostPort, BooleanSupplier connected, Consumer<LanEndpoint> listener) {
+    return new LanDiscovery(context, tracker,
+      jam == null ? LanDiscoveryPacket.ANY_PAIRING_SESSION : jam,
+      hostPort, connected, listener, true);
+  }
+
+  private LanDiscovery(Context context, LocalNetworkTracker tracker, String jam,
+    int hostPort, BooleanSupplier connected, Consumer<LanEndpoint> listener, boolean pairing) {
     this.context = context;
     this.tracker = tracker;
     this.jam = jam;
     this.hostPort = hostPort;
     this.connected = connected;
     this.listener = listener;
+    this.pairing = pairing;
+    discoveryPort = pairing ? PORT + 1 : PORT;
     WifiManager wifi = context.getSystemService(WifiManager.class);
     multicastLock =
       wifi == null ? null : wifi.createMulticastLock("MorpheJam:discovery");
@@ -49,10 +65,13 @@ final class LanDiscovery
   }
 
   void start() {
+    handler.post(() -> {
+    if (closed) return;
     if (multicastLock != null) try {
       multicastLock.acquire();
     } catch (RuntimeException ignored) {}
     tracker.addListener(this);
+    });
   }
 
   public void onTopologyChanged(LocalNetworkTracker.Snapshot snapshot) {
@@ -112,7 +131,7 @@ final class LanDiscovery
         socket = udp;
         if (stopped || closed) return;
         udp.setReuseAddress(true);
-        udp.bind(new InetSocketAddress(hostPort > 0 ? PORT : 0));
+        udp.bind(new InetSocketAddress(hostPort > 0 ? discoveryPort : 0));
         network.bindSocket(udp);
         udp.setBroadcast(true);
         udp.setSoTimeout(80);
@@ -122,7 +141,7 @@ final class LanDiscovery
         );
         if (nic == null) return;
         udp.setNetworkInterface(nic);
-        InetAddress rawGroup = InetAddress.getByName("ff12::4d4a:5032");
+        InetAddress rawGroup = InetAddress.getByName(pairing ? "ff12::4d4a:5033" : "ff12::4d4a:5032");
         Inet6Address group = Inet6Address.getByAddress(
           null,
           rawGroup.getAddress(),
@@ -154,7 +173,7 @@ final class LanDiscovery
         }
         ipv6 &= !TransportOptions.disabled(context, "Ipv6Multicast");
         if (hostPort > 0 && ipv6) try {
-          udp.joinGroup(new InetSocketAddress(group, PORT), nic);
+          udp.joinGroup(new InetSocketAddress(group, discoveryPort), nic);
         } catch (Exception unsupported) {
           ipv6 = false;
         }
@@ -182,13 +201,13 @@ final class LanDiscovery
                   udp,
                   new LanDiscoveryPacket(jam, broadcastNonce, 0).encode(),
                   target,
-                  PORT
+                  discoveryPort
                 );
               if (ipv6) send(
                 udp,
                 new LanDiscoveryPacket(jam, multicastNonce, 0).encode(),
                 group,
-                PORT
+                discoveryPort
               );
               // Wi-Fi power saving can drop early multicast/broadcast bursts.
               // Half a packet per second after backoff avoids an eight-second
@@ -209,7 +228,7 @@ final class LanDiscovery
                   udp,
                   new LanDiscoveryPacket(jam, activeNonce, 0).encode(),
                   probes.get(probeIndex),
-                  PORT
+                  discoveryPort
                 );
                 nextProbeBatch = now + 100;
               }
@@ -227,20 +246,23 @@ final class LanDiscovery
             packet.getOffset(),
             packet.getLength()
           );
-          if (value == null || !jam.equals(value.jam)) continue;
+          if (value == null) continue;
           if (hostPort > 0) {
-            if (value.port == 0 && mayReply()) send(
+            if ((!pairing || !connected.getAsBoolean()) && value.requests(jam, pairing) && mayReply()) send(
               udp,
               new LanDiscoveryPacket(jam, value.nonce, hostPort).encode(),
               packet.getAddress(),
               packet.getPort()
             );
           } else if (!connected.getAsBoolean() && value.port > 0) {
-            DiscoverySource source = value.matches(jam, broadcastNonce)
+            String expectedJam = pairing ? value.jam : jam;
+            if (pairing && !value.matchesPairing(broadcastNonce) &&
+                !value.matchesPairing(multicastNonce) && !value.matchesPairing(activeNonce)) continue;
+            DiscoverySource source = value.matches(expectedJam, broadcastNonce)
               ? DiscoverySource.IPV4_BROADCAST
-              : value.matches(jam, multicastNonce)
+              : value.matches(expectedJam, multicastNonce)
                 ? DiscoverySource.IPV6_MULTICAST
-                : value.matches(jam, activeNonce)
+                : value.matches(expectedJam, activeNonce)
                   ? DiscoverySource.ACTIVE_PROBE
                   : null;
             if (source == null) continue;
@@ -248,12 +270,12 @@ final class LanDiscovery
             Map<String, byte[]> attrs = new HashMap<>();
             attrs.put(
               "jam",
-              jam.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+              value.jam.getBytes(java.nio.charset.StandardCharsets.UTF_8)
             );
             attrs.put("v", new byte[] { '1' });
             LanEndpoint endpoint = new LanEndpoint(
               "udp",
-              "_morphejam._tcp.",
+              pairing ? "_morphepair._tcp." : "_morphejam._tcp.",
               network,
               Collections.singletonList(packet.getAddress()),
               value.port,
@@ -298,11 +320,13 @@ final class LanDiscovery
 
   public void close() {
     closed = true;
+    handler.post(() -> {
     tracker.removeListener(this);
     for (Worker worker : workers.values()) worker.close();
     workers.clear();
     if (
       multicastLock != null && multicastLock.isHeld()
     ) multicastLock.release();
+    });
   }
 }

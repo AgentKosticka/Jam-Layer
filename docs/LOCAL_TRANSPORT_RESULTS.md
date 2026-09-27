@@ -1,5 +1,27 @@
 # Local transport results — 2026-09-27
 
+## QR/code follow-up
+
+The prior broadcast-isolation run left `disableAware=true` and `disableBle=true` in persistent debug preferences on both devices. This suppressed normal QR fallback afterward. Overrides now exist only in the instrumentation process; legacy preferences are ignored. Each fixture verifies that persisted disable flags cannot affect normal defaults.
+
+Code pairing now shares broadcast, IPv6 multicast and bounded active discovery, with normalized/staggered/cancellable TCP candidates. Aware code discovery no longer advertises a code hash or uses a code-derived data-path passphrase. Its versioned public-session discovery requires updated peers; PAKE remains authoritative.
+
+User-controlled setup: phone joined to its existing Wi-Fi, tablet disconnected from infrastructure Wi-Fi with its Wi-Fi radio enabled. Direct Aware invitation joins passed in both orientations (1728/1663 ms; reconnect 2111/2071 ms). Updated Aware code discovery passed in both orientations (1381/1446 ms; reconnect 2497/2497 ms). Normal Auto with all providers enabled passed for invitations (1520 ms, reconnect 2628 ms) and code (1617 ms, reconnect 4604 ms). These exercise the invitation join path, not the camera UI.
+
+After the user reconnected the tablet to the same LAN:
+
+| Short-code discovery | Phone host join/reconnect (ms) | Tablet host join/reconnect (ms) |
+| --- | --- | --- |
+| Broadcast only | 641 / 1208 | 385 / 2277 |
+| IPv6 multicast only | 691 / 1075 | 685 / 1335 |
+| Active probe only | 4945 / 4642 | 4425 / 3326 |
+
+Auto warm-backup checks passed for code (1829 ms join, 41 ms promotion/resync) and invitation (668 ms join, 42 ms promotion/resync). All passing runs assert encrypted commands, duplicate handling, synthetic queue state, forced recovery and cleanup. The first broadcast test overlapped the user disconnecting the tablet and timed out; its logs remain under `fix-code-broadcast`, excluded from the same-LAN checks above.
+
+47 unit tests pass and both APKs assemble. Final installed debug APK SHA-256: `97924D3B9C25F91248F37F54D358492AEFD25650EE2D753D90CA2F8AF654672E`. Reverse LAN-provider runs and the invitation backup check used this final build; earlier follow-up runs preceded only the separation of pairing provenance from normal reconnect targets. Saved user pairing was backed up before fixture runs for restoration afterward. These are targeted regression checks, not a rerun of the complete release gate or real YTM/audio validation.
+
+## Earlier implementation gate
+
 Measured on A069P (Android 37) and SM-X620 (Android 36), same Wi-Fi, both host orientations. Times include authentication. Recovery includes state retrieval after a forced socket close; cold recovery also includes the existing failure-detection/retry schedule. Warm tests actively trigger failure detection and include promotion/state resync. These are small-sample observations, not guaranteed latency.
 
 | Scenario | Passed / attempted | Join median / worst (ms) | Recovery median / worst (ms) |

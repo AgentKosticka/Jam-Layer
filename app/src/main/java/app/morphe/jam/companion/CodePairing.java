@@ -20,6 +20,7 @@ public final class CodePairing implements AutoCloseable {
   static final class Handoff implements AutoCloseable {
 
     final String invitation, transport, route;
+    LanEndpoint endpoint;
     private Socket socket;
     private ChannelTransport direct;
     private AutoCloseable path;
@@ -93,6 +94,7 @@ public final class CodePairing implements AutoCloseable {
   private final Context context;
   private final LocalNetworkTracker topology;
   private final LanAdvertiser advertiser;
+  private final LanDiscovery localDiscovery;
   private final ServerSocket server;
   private final Invitation invite;
   private final String code = CodeExchange.generate();
@@ -135,7 +137,10 @@ public final class CodePairing implements AutoCloseable {
       status -> android.util.Log.i("MorpheJam", "Code pairing " + status)
     );
     advertiser.start();
-    aware = AwareCodePairing.host(
+    localDiscovery = LanDiscovery.pairing(this.context, topology, invite.jamId,
+      server.getLocalPort(), () -> !valid(), endpoint -> {});
+    localDiscovery.start();
+    aware = TransportOptions.disabled(this.context, "Aware") ? null : AwareCodePairing.host(
       this.context,
       invite,
       code,
@@ -165,7 +170,8 @@ public final class CodePairing implements AutoCloseable {
         }
       }
     });
-    bleHandler.postDelayed(() -> { if (!closed) ble.start(); }, Nearby.bleDelay(this.context, "Auto"));
+    if (!TransportOptions.disabled(this.context, "Ble"))
+      bleHandler.postDelayed(() -> { if (!closed) ble.start(); }, Nearby.bleDelay(this.context, "Auto"));
     workers.execute(() -> {
       int attempts = 0,
         inWindow = 0;
@@ -243,6 +249,7 @@ public final class CodePairing implements AutoCloseable {
     if (aware != null) aware.close();
     aware = null;
     advertiser.close();
+    localDiscovery.close();
     topology.close();
     try {
       server.close();
@@ -264,7 +271,7 @@ public final class CodePairing implements AutoCloseable {
     Context app = context.getApplicationContext();
     LocalNetworkTracker topology = new LocalNetworkTracker(app);
     topology.start();
-    ScheduledExecutorService worker = Executors.newScheduledThreadPool(3);
+    ScheduledExecutorService worker = Executors.newScheduledThreadPool(6);
     CompletableFuture<Handoff> result = new CompletableFuture<>();
     BleNearby[] bleHolder = new BleNearby[1];
     BleNearby ble = new BleNearby(app, BLE_PAIRING, false, new BleNearby.Listener() {
@@ -291,17 +298,14 @@ public final class CodePairing implements AutoCloseable {
       }
     });
     bleHolder[0] = ble;
-    if ("Auto".equals(mode) || "BLE".equals(mode))
+    if (!TransportOptions.disabled(app, "Ble") && ("Auto".equals(mode) || "BLE".equals(mode)))
       worker.schedule(() -> { if (!result.isDone()) ble.start(); }, Nearby.bleDelay(app, mode), TimeUnit.MILLISECONDS);
-    AwareCodePairing aware = "BLE".equals(mode) || "LAN".equals(mode) ? null : AwareCodePairing.find(app, code, result);
+    AwareCodePairing aware = TransportOptions.disabled(app, "Aware") || "BLE".equals(mode) || "LAN".equals(mode) ? null : AwareCodePairing.find(app, code, result);
     Map<String, LanEndpoint> endpoints = new ConcurrentHashMap<>();
     Map<String, Integer> attempts = new ConcurrentHashMap<>();
     Set<Socket> sockets = ConcurrentHashMap.newKeySet();
-    LanBrowser browser = new LanBrowser(
-      app,
-      topology,
-      TYPE,
-      new LanBrowser.Listener() {
+    Set<LanConnection.Attempt> connecting = ConcurrentHashMap.newKeySet();
+    LanBrowser.Listener discoveryListener = new LanBrowser.Listener() {
         @Override
         public void onEndpoint(LanEndpoint endpoint) {
           byte[] id = endpoint.attributes.get("jam");
@@ -312,8 +316,20 @@ public final class CodePairing implements AutoCloseable {
           } catch (Exception error) {
             return;
           }
-          if (endpoints.putIfAbsent(endpoint.fingerprint, endpoint) == null)
-            attempt(endpoint, jam);
+          int stagger = 0;
+          for (InetAddress address : endpoint.addresses) {
+            if (address == null || address.isAnyLocalAddress() || address.isMulticastAddress()) continue;
+            List<android.net.Network> networks = endpoint.network != null
+              ? Collections.singletonList(endpoint.network) : topology.snapshot().localNetworks;
+            if (networks.isEmpty()) networks = Collections.singletonList(null);
+            for (android.net.Network network : networks) {
+              LanEndpoint target = endpoint.single(network, address);
+              if (endpoints.size() >= 256) return;
+              if (endpoints.putIfAbsent(target.candidateKey(), target) == null) try {
+                worker.schedule(() -> attempt(target, jam), stagger++ * 100L, TimeUnit.MILLISECONDS);
+              } catch (RejectedExecutionException stopped) {}
+            }
+          }
         }
 
         @Override
@@ -323,28 +339,32 @@ public final class CodePairing implements AutoCloseable {
               endpoint.serviceName.equals(name) &&
               endpoint.discoveryHandle == networkHandle
             ) {
-              endpoints.remove(endpoint.fingerprint, endpoint);
-              attempts.remove(endpoint.fingerprint);
+              endpoints.remove(endpoint.candidateKey(), endpoint);
+              attempts.remove(endpoint.candidateKey());
             }
         }
 
         private void attempt(LanEndpoint endpoint, String jam) {
-          if (result.isDone() || endpoints.get(endpoint.fingerprint) != endpoint)
+          if (result.isDone() || endpoints.get(endpoint.candidateKey()) != endpoint)
             return;
-          int number = attempts.merge(endpoint.fingerprint, 1, Integer::sum);
+          int number = attempts.merge(endpoint.candidateKey(), 1, Integer::sum);
           if (number > 3) return;
           try {
             worker.execute(() -> {
               if (
                 result.isDone() ||
-                endpoints.get(endpoint.fingerprint) != endpoint
+                endpoints.get(endpoint.candidateKey()) != endpoint
               ) return;
               Socket socket = null;
+              LanConnection.Attempt lifetime = new LanConnection.Attempt();
+              connecting.add(lifetime);
               try {
+                if (result.isDone()) return;
                 LanConnection.Result connected = LanConnection.connect(
                   endpoint,
                   topology.snapshot(),
-                  4000
+                  4000,
+                  lifetime
                 );
                 socket = connected.socket;
                 sockets.add(socket);
@@ -355,8 +375,12 @@ public final class CodePairing implements AutoCloseable {
                   connected.route.name(),
                   null
                 );
+                handoff.endpoint = endpoint;
+                // Transfer before publishing: find() cancels every remaining attempt.
+                lifetime.detach(socket);
+                sockets.remove(socket);
                 if (result.complete(handoff)) {
-                  sockets.remove(socket);
+                  android.util.Log.i("MorpheJam", "Code authenticated source=" + endpoint.source);
                   socket = null;
                 } else handoff.close();
               } catch (Exception ignored) {
@@ -368,6 +392,8 @@ public final class CodePairing implements AutoCloseable {
                   );
                 } catch (RejectedExecutionException closed) {}
               } finally {
+                lifetime.close();
+                connecting.remove(lifetime);
                 if (socket != null) try {
                   socket.close();
                 } catch (Exception ignored) {}
@@ -381,9 +407,14 @@ public final class CodePairing implements AutoCloseable {
         public void onLanStatus(String status) {
           android.util.Log.i("MorpheJam", "Code pairing " + status);
         }
-      }
-    );
-    if (!"BLE".equals(mode) && !"Aware".equals(mode)) browser.start();
+      };
+    LanBrowser browser = new LanBrowser(app, topology, TYPE, discoveryListener);
+    LanDiscovery localDiscovery = LanDiscovery.pairing(app, topology, null, 0,
+      result::isDone, discoveryListener::onEndpoint);
+    if (!"BLE".equals(mode) && !"Aware".equals(mode)) {
+      browser.start();
+      localDiscovery.start();
+    }
     Handoff found = null;
     try {
       found = result.get(30, TimeUnit.SECONDS);
@@ -404,7 +435,9 @@ public final class CodePairing implements AutoCloseable {
       if (aware != null && (found == null || !"Aware".equals(found.transport))) aware.close();
       if (found == null || !"BLE".equals(found.transport)) ble.close();
       browser.close();
+      localDiscovery.close();
       topology.close();
+      for (LanConnection.Attempt attempt : connecting) attempt.close();
       for (Socket socket : sockets)
         try {
           socket.close();

@@ -8,6 +8,7 @@ final class LanDiscoveryPacket {
 
   static final int SIZE = 32,
     MAGIC = 0x4d4a5032;
+  static final String ANY_PAIRING_SESSION = "00000000-0000-0000-0000-000000000000";
   final String jam;
   final long nonce;
   final int port;
@@ -52,5 +53,14 @@ final class LanDiscoveryPacket {
 
   boolean matches(String expectedJam, long expectedNonce) {
     return port > 0 && jam.equals(expectedJam) && nonce == expectedNonce;
+  }
+
+  boolean requests(String hostJam, boolean pairing) {
+    return port == 0 && (jam.equals(hostJam) ||
+      (pairing && ANY_PAIRING_SESSION.equals(jam)));
+  }
+
+  boolean matchesPairing(long expectedNonce) {
+    return port > 0 && !ANY_PAIRING_SESSION.equals(jam) && nonce == expectedNonce;
   }
 }

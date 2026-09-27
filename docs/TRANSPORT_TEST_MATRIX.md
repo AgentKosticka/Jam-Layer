@@ -77,3 +77,11 @@ Each successful two-device run asserts authentication, one-item synthetic queue 
 Remaining acceptance: real Bluetooth headphones/speaker playback; actual patched YouTube Music native queue edits and internet playback; VPN/lockdown/AP roaming and Wi-Fi-off topology transitions; mixed-version hosts/guests; older Android hardware; many participants; no-restart endurance. The implementation is not claimed release-complete for those environments. Host invitation hints currently advertise IPv4 only, and scoring does not use RTT/instability history.
 
 Detailed measured results are in [LOCAL_TRANSPORT_RESULTS.md](LOCAL_TRANSPORT_RESULTS.md). Raw logs are local ignored build outputs under `build/transport-results`.
+
+## QR/code follow-up on 2026-09-27
+
+Fixed persistent instrumentation flags that had disabled Aware/BLE during later normal use. Provider switches are now process-local and debug-only. A fixture regression check writes legacy disable preferences and verifies they have no effect.
+
+With the phone on Wi-Fi and the tablet disconnected while keeping its radio on, invitation and code joins authenticated over Aware in both orientations and recovered after forced failure. Normal Auto joins also passed in this setup. After the user restored the shared LAN, code joins passed with broadcast, IPv6 and active-probe discovery individually isolated in both orientations. Invitation and code warm-backup checks passed. Discovery-source assertions include the reused code-pairing socket. See the follow-up results table for timings/build scope.
+
+The Aware code-discovery upgrade removes code-derived advertisements and data-path metadata and uses the versioned `morphepair-v2` service; mixed old/new Aware code pairing is intentionally unsupported. PAKE/SecureChannel, QR formats and LAN/BLE pairing remain unchanged. Unit total is now 47 passing. Full multi-host discovery, mixed-version fallback, camera/UI acceptance and real music/audio testing remain outstanding.

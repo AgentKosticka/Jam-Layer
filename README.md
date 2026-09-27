@@ -48,6 +48,10 @@ Local joins race direct invitation hints, NSD, IPv4 directed broadcast and IPv6
 link-local multicast. A delayed, bounded UDP subnet probe recovers when other
 discovery is filtered. Auto can keep an authenticated LAN/Aware backup and promote
 it when the primary fails. Every candidate still passes SecureChannel authentication.
+Short-code joins also use broadcast, IPv6 multicast and bounded probing, then
+authenticate with PAKE and reuse that connection. Without a shared LAN, keep
+Wi-Fi enabled on both devices for direct Wi-Fi Aware discovery. Aware short-code
+discovery requires both devices to run the updated `morphepair-v2` protocol.
 See [transport architecture](docs/TRANSPORT_ARCHITECTURE.md) and the
 [device validation matrix](docs/TRANSPORT_TEST_MATRIX.md).
 

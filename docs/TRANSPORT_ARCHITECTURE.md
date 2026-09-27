@@ -18,6 +18,10 @@ LAN discovery layers:
 
 MJP2 packets are exactly 32 bytes: magic, version, request/offer kind, UUID, random 64-bit correlation nonce, port. Parsers reject incorrect lengths, versions, kinds and request/offer port combinations. Providers use distinct nonces. Host replies are capped at 32/second across discovery sockets. Packets contain no invitation secrets, pairing codes, verifiers or channel keys.
 
+Short-code pairing uses the same broadcast, IPv6 and bounded active-probe implementation on UDP 39549 and multicast group `ff12::4d4a:5033`, in parallel with existing NSD/gateway discovery. A wildcard public-session request is accepted only by the pairing responder; replies identify the public Jam ID and pairing port. Code verification remains J-PAKE followed by SecureChannel. Address/network candidates are deduplicated and staggered; losing TCP attempts close even during connect. The winning pairing socket transfers into the Jam session without another discovery round. Its pairing port is not cached as a normal Jam reconnect endpoint.
+
+Aware code discovery uses `morphepair-v2` and advertises only a version and public Jam ID. Its Android data-path passphrase is derived only from that public ID, and provides no peer authentication; J-PAKE and SecureChannel remain mandatory. The previous code-derived advertisement and data-path passphrase have been removed to prevent offline code checking. Both peers need this update for Aware short-code discovery; LAN/BLE pairing and QR invitation formats are unchanged.
+
 ## Authenticated backup and handover
 
 Auto retains one independently authenticated backup on the other LAN/Aware transport. A healthy LAN/Aware primary is not switched merely because the other appeared. BLE still upgrades to LAN/Aware. Backups carry PING only, every 30 seconds; host read budget is 45 seconds.
@@ -36,6 +40,6 @@ Existing BLE policy remains conservative: any connected Bluetooth audio output p
 
 `TransportDiagnostics` keeps a 128-event session timeline and structured local logcat with elapsed time, source, address family, network handle, duration and failure category. It never accepts invitations/payloads. `STATE` adds `backupTransport` and logical peer count.
 
-The separate instrumentation APK extends `LayerScenario` with provider isolation, expected authenticated source, forced primary close, recovery timing and backup validation. `TransportOptions` preferences are ignored in non-debuggable builds. `scripts/test-local-transport.ps1` saves results and both-device logs under `build/transport-results`. The fixture validates encrypted commands, duplicates, canonical state and cleanup; it is not a real YTM playback/native queue test.
+The separate instrumentation APK extends `LayerScenario` with provider isolation, expected authenticated source, forced primary close, recovery timing and backup validation. `TransportOptions` overrides are process-local and available only in debuggable builds. Legacy persistent preferences are ignored, so a test cannot leave Aware/BLE disabled in a later normal app session. The fixture explicitly checks that regression. `scripts/test-local-transport.ps1` saves results and both-device logs under `build/transport-results`. The fixture validates encrypted commands, duplicates, canonical state and cleanup; it is not a real YTM playback/native queue test.
 
 Current limits: host hints advertise IPv4 only; scoring lacks RTT/instability; failure categories cover socket/authentication rather than every Aware/BLE phase; session states remain incremental. VPN/AP roaming, many-client capacity, mixed-version and Bluetooth playback acceptance remain separate from the same-LAN gate.

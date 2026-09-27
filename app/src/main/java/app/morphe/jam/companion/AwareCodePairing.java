@@ -12,7 +12,7 @@ import java.util.concurrent.*;
 
 final class AwareCodePairing implements AutoCloseable {
 
-  private static final String SERVICE = "morphepair",
+  private static final String SERVICE = "morphepair-v2",
     REQUEST = "PAIR:",
     READY = "READY:";
 
@@ -55,7 +55,7 @@ final class AwareCodePairing implements AutoCloseable {
   private final WifiAwareManager manager;
   private final Runnable retryAware = this::attach;
   private final boolean host;
-  private final String code, tag, jam;
+  private final String code, jam;
   private final int port;
   private final CompletableFuture<CodePairing.Handoff> result;
   private WifiAwareSession aware;
@@ -76,7 +76,6 @@ final class AwareCodePairing implements AutoCloseable {
     this.context = context.getApplicationContext();
     host = invite != null;
     this.code = CodeExchange.normalize(code);
-    tag = tag(this.code);
     jam = host ? invite.jamId : null;
     this.port = port;
     this.result = result;
@@ -115,18 +114,6 @@ final class AwareCodePairing implements AutoCloseable {
     );
     pairing.start();
     return pairing;
-  }
-
-  private static String tag(String code) {
-    try {
-      return SecureChannel.encode(
-        MessageDigest.getInstance("SHA-256").digest(
-          ("morphejam-pair/1/" + code).getBytes(StandardCharsets.UTF_8)
-        )
-      );
-    } catch (Exception e) {
-      throw new IllegalStateException(e);
-    }
   }
 
   private void start() {
@@ -221,10 +208,11 @@ final class AwareCodePairing implements AutoCloseable {
                 List<byte[]> filter
               ) {
                 if (host || !active(expected) || session == null) return;
-                String found = parseJam(info, tag);
+                String found = parseJam(info);
                 if (found == null) return;
+                if (!candidates.containsKey(peer) && candidates.size() >= 32) return;
                 candidates.put(peer, new Candidate(peer, found));
-                send(peer, REQUEST + tag);
+                send(peer, REQUEST + found);
                 android.util.Log.i("MorpheJam", "Aware code host discovered");
               }
 
@@ -238,7 +226,7 @@ final class AwareCodePairing implements AutoCloseable {
                 );
                 if (host) {
                   if (
-                    (REQUEST + tag).equals(value) &&
+                    (REQUEST + jam).equals(value) &&
                     path(peer, null, 0, expected)
                   ) send(peer, READY + jam + ":" + port);
                   return;
@@ -274,7 +262,7 @@ final class AwareCodePairing implements AutoCloseable {
                 new PublishConfig.Builder()
                   .setServiceName(SERVICE)
                   .setServiceSpecificInfo(
-                    (tag + ":" + jam).getBytes(StandardCharsets.UTF_8)
+                    ("2:" + jam).getBytes(StandardCharsets.UTF_8)
                   )
                   .build(),
                 callback,
@@ -344,10 +332,10 @@ final class AwareCodePairing implements AutoCloseable {
     retryAttach();
   }
 
-  private static String parseJam(byte[] info, String tag) {
+  static String parseJam(byte[] info) {
     if (info == null) return null;
     String value = new String(info, StandardCharsets.UTF_8),
-      prefix = tag + ":";
+      prefix = "2:";
     if (!value.startsWith(prefix)) return null;
     String found = value.substring(prefix.length());
     try {
@@ -372,12 +360,13 @@ final class AwareCodePairing implements AutoCloseable {
   }
 
   /** Android allows a port-bearing Aware data path only when it is secured. */
-  private String dataPathPassphrase() throws java.security.GeneralSecurityException {
+  static String dataPathPassphrase(String jam) throws java.security.GeneralSecurityException {
+    // Android requires a secured data path to advertise the TCP port. This
+    // public, session-scoped value is routing metadata, never proof of the code.
+    // PAKE and SecureChannel independently authenticate the peer afterward.
     return SecureChannel.encode(
-      SecureChannel.hmac(
-        "morphejam-code-aware-path-v1".getBytes(StandardCharsets.UTF_8),
-        code.getBytes(StandardCharsets.UTF_8)
-      )
+      MessageDigest.getInstance("SHA-256").digest(
+        ("morphejam-code-aware-path-v2/" + jam).getBytes(StandardCharsets.UTF_8))
     );
   }
 
@@ -437,7 +426,7 @@ final class AwareCodePairing implements AutoCloseable {
     try {
       WifiAwareNetworkSpecifier.Builder builder =
         new WifiAwareNetworkSpecifier.Builder(session, peer).setPskPassphrase(
-          dataPathPassphrase()
+          dataPathPassphrase(host ? jam : candidate.jam)
         );
       if (host) builder.setPort(port).setTransportProtocol(6);
       int attempt = retries.getOrDefault(peer, 0) + 1;
@@ -587,7 +576,7 @@ final class AwareCodePairing implements AutoCloseable {
       if (!active(expected)) return;
       if (host) {
         if (path(peer, null, 0, expected)) send(peer, READY + jam + ":" + port);
-      } else if (candidate != null) send(peer, REQUEST + tag);
+      } else if (candidate != null) send(peer, REQUEST + candidate.jam);
     }, attempt * 500L);
   }
 

@@ -523,7 +523,7 @@ public final class JamService extends Service {
           // Register before handing the connection to a worker so end() can close
           // it if the user cancels during the Jam handshake.
           connections.add(connection);
-          nearby.pairedConnection(connection, handoff.transport, handoff.route);
+          nearby.pairedConnection(connection, handoff.transport, handoff.route, handoff.endpoint);
         } catch (Exception error) {
           if (connection != null) {
             connections.remove(connection);

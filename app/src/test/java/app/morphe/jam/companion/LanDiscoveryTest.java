@@ -9,6 +9,23 @@ import org.junit.Test;
 public class LanDiscoveryTest {
 
   @Test
+  public void pairingWildcardCannotDiscoverJamListener() {
+    String jam = UUID.randomUUID().toString();
+    LanDiscoveryPacket request = new LanDiscoveryPacket(
+      LanDiscoveryPacket.ANY_PAIRING_SESSION, 42, 0);
+    assertTrue(request.requests(jam, true));
+    assertFalse(request.requests(jam, false));
+    LanDiscoveryPacket offer = new LanDiscoveryPacket(jam, 42, 1234);
+    assertTrue(offer.matchesPairing(42));
+    assertFalse(offer.matchesPairing(43));
+    assertFalse(offer.requests(jam, true));
+    assertFalse(new LanDiscoveryPacket(LanDiscoveryPacket.ANY_PAIRING_SESSION, 42, 1234)
+      .matchesPairing(42));
+    assertFalse(new LanDiscoveryPacket(UUID.randomUUID().toString(), 42, 0)
+      .requests(jam, true));
+  }
+
+  @Test
   public void directedBroadcastUsesActualPrefix() throws Exception {
     InetAddress local = InetAddress.getByName("10.20.4.17");
     assertEquals(

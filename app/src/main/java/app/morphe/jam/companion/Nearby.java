@@ -36,6 +36,7 @@ public final class Nearby implements AutoCloseable {
     private final int generation;
     private final AwareDataPath path;
     private final LanEndpoint endpoint;
+    private LanEndpoint provenance;
     private State state = State.PENDING;
 
     private ConnectionCandidate(
@@ -54,6 +55,7 @@ public final class Nearby implements AutoCloseable {
       this.generation = generation;
       this.path = path;
       this.endpoint = endpoint;
+      this.provenance = endpoint;
     }
 
     public ChannelTransport connection() {
@@ -285,11 +287,12 @@ public final class Nearby implements AutoCloseable {
   void pairedConnection(
     ChannelTransport connection,
     String transport,
-    String route
+    String route,
+    LanEndpoint endpoint
   ) {
-    handler.post(() ->
-      deliver(
-        new ConnectionCandidate(
+    handler.post(() -> {
+      // A pairing endpoint speaks PAKE first; it is provenance, not a Jam reconnect target.
+      ConnectionCandidate candidate = new ConnectionCandidate(
           this,
           connection,
           transport,
@@ -297,9 +300,10 @@ public final class Nearby implements AutoCloseable {
           awareGeneration,
           null,
           null
-        )
-      )
-    );
+        );
+      candidate.provenance = endpoint;
+      deliver(candidate);
+    });
   }
 
   private boolean strongWinner() {
@@ -1144,7 +1148,7 @@ public final class Nearby implements AutoCloseable {
       ),
       SystemClock.elapsedRealtime()
     );
-    diagnostics.event("AUTH_SUCCESS", candidate.endpoint, 0, "");
+    diagnostics.event("AUTH_SUCCESS", candidate.provenance, 0, "");
     if (host) {
       candidates.remove(candidate);
       return;
