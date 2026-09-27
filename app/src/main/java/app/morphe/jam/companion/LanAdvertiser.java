@@ -29,7 +29,8 @@ final class LanAdvertiser
   private final Map<Long, Integer> registrationFailures = new HashMap<>();
   private final Map<Long, Runnable> registrationRetries = new HashMap<>();
   private AutoCloseable probeRegistration;
-  private boolean legacyRegistered, closed;
+  private boolean legacyRegistered;
+  private volatile boolean closed;
 
   LanAdvertiser(
     Context context,
@@ -52,6 +53,10 @@ final class LanAdvertiser
   }
 
   void start() {
+    if (Looper.myLooper() != Looper.getMainLooper()) {
+      handler.post(this::start);
+      return;
+    }
     if (closed || probeRegistration != null) return;
     probeRegistration = LanProbe.advertise(
       tracker,
@@ -106,16 +111,21 @@ final class LanAdvertiser
       new NsdManager.RegistrationListener() {
         @Override
         public void onServiceRegistered(NsdServiceInfo ignored) {
-          registrationFailures.remove(handle);
-          listener.onLanStatus("LAN advertised");
+          handler.post(() -> {
+            if (closed || registrations.get(handle) != this) return;
+            registrationFailures.remove(handle);
+            listener.onLanStatus("LAN advertised");
+          });
         }
 
         @Override
         public void onRegistrationFailed(NsdServiceInfo ignored, int error) {
-          if (removeIfCurrent(handle, this)) {
-            listener.onLanStatus("LAN registration failed: " + error);
-            scheduleRetry(handle);
-          }
+          handler.post(() -> {
+            if (!closed && removeIfCurrent(handle, this)) {
+              listener.onLanStatus("LAN registration failed: " + error);
+              scheduleRetry(handle);
+            }
+          });
         }
 
         @Override
@@ -123,7 +133,9 @@ final class LanAdvertiser
 
         @Override
         public void onUnregistrationFailed(NsdServiceInfo ignored, int error) {
-          if (removeIfCurrent(handle, this)) scheduleRetry(handle);
+          handler.post(() -> {
+            if (removeIfCurrent(handle, this)) scheduleRetry(handle);
+          });
         }
       };
     try {
@@ -180,6 +192,10 @@ final class LanAdvertiser
   @Override
   public void close() {
     closed = true;
+    if (Looper.myLooper() != Looper.getMainLooper()) {
+      handler.post(this::close);
+      return;
+    }
     tracker.removeListener(this);
     if (probeRegistration != null) try {
       probeRegistration.close();

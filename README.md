@@ -44,6 +44,13 @@ Morphe Manager consumer test before the coordinated release is considered comple
 
 ## VPNs and local networking
 
+Local joins race direct invitation hints, NSD, IPv4 directed broadcast and IPv6
+link-local multicast. A delayed, bounded UDP subnet probe recovers when other
+discovery is filtered. Auto can keep an authenticated LAN/Aware backup and promote
+it when the primary fails. Every candidate still passes SecureChannel authentication.
+See [transport architecture](docs/TRANSPORT_ARCHITECTURE.md) and the
+[device validation matrix](docs/TRANSPORT_TEST_MATRIX.md).
+
 Jam Layer never process-binds the app away from a VPN. On Android versions that
 support it, it discovers services and opens LAN sockets on the physical Wi-Fi or
 Ethernet network explicitly; system routing is only a fallback for a VPN's own

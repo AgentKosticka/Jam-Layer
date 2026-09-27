@@ -10,6 +10,33 @@ import org.junit.Test;
 
 public class LanConnectionTest {
 
+  @Test
+  public void cancellationClosesPendingAndLateSockets() throws Exception {
+    LanConnection.Attempt attempt = new LanConnection.Attempt();
+    FakeSocket first = new FakeSocket(false),
+      late = new FakeSocket(false);
+    attempt.add(first);
+    attempt.close();
+    attempt.close();
+    assertTrue(first.closed);
+    try {
+      attempt.add(late);
+      fail();
+    } catch (SocketException expected) {}
+    assertTrue(late.closed);
+  }
+
+  @Test
+  public void authenticatedOwnerCanDetachSocketBeforeDiscoveryCloses()
+    throws Exception {
+    LanConnection.Attempt attempt = new LanConnection.Attempt();
+    FakeSocket winner = new FakeSocket(false);
+    attempt.add(winner);
+    attempt.detach(winner);
+    attempt.close();
+    assertFalse(winner.closed);
+  }
+
   private static final class FakeSocket extends Socket {
 
     final boolean fail;

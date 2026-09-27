@@ -34,6 +34,30 @@ public final class JamService extends Service {
   private volatile IJamBridge bridge;
   private volatile Invitation invitation;
   private volatile SecureChannel channel;
+
+  private static final class WarmChannel {
+
+    final SecureChannel channel;
+    final Nearby.ConnectionCandidate candidate;
+
+    WarmChannel(SecureChannel channel, Nearby.ConnectionCandidate candidate) {
+      this.channel = channel;
+      this.candidate = candidate;
+    }
+  }
+
+  private volatile WarmChannel backupChannel;
+  private final Object backupLock = new Object();
+  private final java.util.concurrent.atomic.AtomicLong connectionEpoch =
+    new java.util.concurrent.atomic.AtomicLong();
+  private final Map<
+    String,
+    ChannelAuthority<SecureChannel>
+  > channelAuthorities = new ConcurrentHashMap<>();
+  private final Map<
+    String,
+    java.util.concurrent.atomic.AtomicInteger
+  > participants = new ConcurrentHashMap<>();
   private volatile String bleState = "idle";
   private volatile String role = "Idle",
     transport = "None",
@@ -155,6 +179,76 @@ public final class JamService extends Service {
       500,
       TimeUnit.MILLISECONDS
     );
+    monitor.scheduleWithFixedDelay(
+      () -> workers.execute(this::pingBackup),
+      30,
+      30,
+      TimeUnit.SECONDS
+    );
+  }
+
+  private boolean channelRole(SecureChannel peer, String role)
+    throws Exception {
+    peer.setReadTimeout(3000);
+    peer.send(
+      new JSONObject()
+        .put("op", "CHANNEL")
+        .put("version", 1)
+        .put("role", role)
+        .put("epoch", connectionEpoch.incrementAndGet())
+        .toString()
+    );
+    return new JSONObject(peer.receive()).optBoolean("ok");
+  }
+
+  private void pingBackup() {
+    synchronized (backupLock) {
+      WarmChannel standby = backupChannel;
+      if (standby == null) return;
+      try {
+        standby.channel.setReadTimeout(2000);
+        standby.channel.send(new JSONObject().put("op", "PING").toString());
+        if (
+          !new JSONObject(standby.channel.receive()).optBoolean("ok")
+        ) throw new IOException("Backup ping failed");
+      } catch (Exception error) {
+        if (backupChannel == standby) backupChannel = null;
+        standby.candidate.close();
+      }
+    }
+  }
+
+  /** Called with client request serialization held, outside the lifecycle monitor. */
+  private boolean promoteBackup(Invitation expected) {
+    synchronized (backupLock) {
+      WarmChannel standby = backupChannel;
+      if (standby == null) return false;
+      try {
+        if (!channelRole(standby.channel, "PRIMARY")) throw new IOException(
+          "Stale channel epoch"
+        );
+        synchronized (lifecycle) {
+          if (
+            invitation != expected ||
+            !expected.valid() ||
+            backupChannel != standby
+          ) return false;
+          backupChannel = null;
+          channel = standby.channel;
+          transport = displayTransport(standby.candidate);
+          lanRoute = standby.candidate.route();
+          message = "Authenticated host connected";
+          nearby.promoteBackup(standby.candidate);
+          nearby.diagnostics.event("BACKUP_PROMOTED_" + transport, null, 0, "");
+          workers.execute(() -> sync(expected));
+          return true;
+        }
+      } catch (Exception error) {
+        if (backupChannel == standby) backupChannel = null;
+        standby.candidate.close();
+        return false;
+      }
+    }
   }
 
   public void bindMusic() {
@@ -250,9 +344,16 @@ public final class JamService extends Service {
       return ok()
         .put("role", role)
         .put("transport", transport)
+        .put(
+          "backupTransport",
+          backupChannel == null ? "None" : backupChannel.candidate.transport()
+        )
         .put("message", message)
         .put("paired", bridge != null)
-        .put("peers", connections.size())
+        .put(
+          "peers",
+          "Host".equals(role) ? participants.size() : channel == null ? 0 : 1
+        )
         .put("allowGuestEdits", allowGuestEdits)
         .put("lanState", lanState)
         .put("awareState", awareState)
@@ -422,15 +523,7 @@ public final class JamService extends Service {
           // Register before handing the connection to a worker so end() can close
           // it if the user cancels during the Jam handshake.
           connections.add(connection);
-          ChannelTransport direct = connection;
-          workers.execute(() ->
-            authenticatePairedHost(
-              next,
-              direct,
-              handoff.transport,
-              handoff.route
-            )
-          );
+          nearby.pairedConnection(connection, handoff.transport, handoff.route);
         } catch (Exception error) {
           if (connection != null) {
             connections.remove(connection);
@@ -445,73 +538,6 @@ public final class JamService extends Service {
             error
           );
         }
-      }
-    }
-  }
-
-  /** Promotes the already-open short-code socket instead of rediscovering it. */
-  private void authenticatePairedHost(
-    Invitation expected,
-    ChannelTransport connection,
-    String pairedTransport,
-    String route
-  ) {
-    SecureChannel authenticated = null;
-    boolean won = false;
-    try {
-      authenticated = new SecureChannel(
-        connection,
-        false,
-        expected.jamId,
-        expected.secret,
-        identity
-      );
-      synchronized (connectionLock) {
-        synchronized (lifecycle) {
-          if (
-            invitation == expected &&
-            expected.valid() &&
-            "Participant".equals(role) &&
-            channel == null
-          ) {
-            channel = authenticated;
-            connections.add(connection);
-            transport = pairedTransport;
-            lanRoute = route;
-            message = "Authenticated host connected";
-            won = true;
-          }
-        }
-      }
-      if (!won) return;
-      android.util.Log.i(
-        "MorpheJam",
-        "Promoted paired transport=" + pairedTransport + " route=" + route
-      );
-      synchronized (lifecycle) {
-        if (invitation != expected) return;
-        Nearby discovery = nearby;
-        if (!"BLE".equals(pairedTransport)) {
-          nearby = null;
-          if (discovery != null) discovery.close();
-        } else if (discovery != null) discovery.pairedBleConnected();
-      }
-      workers.execute(() -> sync(expected));
-    } catch (Exception error) {
-      android.util.Log.w(
-        "MorpheJam",
-        "Paired host authentication failed",
-        error
-      );
-    } finally {
-      if (!won) {
-        if (authenticated != null) try {
-          authenticated.close();
-        } catch (Exception ignored) {}
-        else try {
-          connection.close();
-        } catch (Exception ignored) {}
-        connections.remove(connection);
       }
     }
   }
@@ -644,6 +670,7 @@ public final class JamService extends Service {
       }
       workers.execute(() -> {
         SecureChannel authenticated = null;
+        boolean retained = false;
         try {
           authenticated = new SecureChannel(
             offered.connection(),
@@ -652,56 +679,73 @@ public final class JamService extends Service {
             expected.secret,
             identity
           );
+          // This extension runs inside the existing encrypted channel. Old hosts
+          // reject the unknown op and remain usable as primary-only sessions.
+          boolean roles = channelRole(authenticated, "BACKUP");
+          synchronized (connectionLock) {
+            if (
+              invitation != expected ||
+              sessionEpoch != epoch ||
+              !expected.valid()
+            ) return;
+            boolean primary =
+              channel == null ||
+              ("BLE".equals(transport) && !"BLE".equals(offered.transport()));
+            if (
+              primary && roles && !channelRole(authenticated, "PRIMARY")
+            ) throw new IOException("Channel promotion rejected");
+            synchronized (lifecycle) {
+              if (
+                invitation != expected ||
+                sessionEpoch != epoch ||
+                !expected.valid() ||
+                !"Participant".equals(role)
+              ) return;
+              if (primary && offered.accept()) {
+                SecureChannel previous = channel;
+                channel = authenticated;
+                if (previous != null) try {
+                  previous.close();
+                } catch (Exception ignored) {}
+                connections.removeIf(ChannelTransport::isClosed);
+                connections.add(offered.connection());
+                transport = displayTransport(offered);
+                lanRoute = offered.route();
+                message = "Authenticated host connected";
+                retained = true;
+                android.util.Log.i(
+                  "MorpheJam",
+                  "Authenticated transport=" +
+                    offered.transport() +
+                    " route=" +
+                    offered.route()
+                );
+                workers.execute(() -> sync(expected));
+              } else if (
+                !primary &&
+                roles &&
+                backupChannel == null &&
+                offered.acceptBackup()
+              ) {
+                backupChannel = new WarmChannel(authenticated, offered);
+                connections.add(offered.connection());
+                retained = true;
+              }
+            }
+          }
         } catch (Exception error) {
-          offered.reject();
           if (
             invitation == expected && sessionEpoch == epoch && channel == null
           ) message =
             "Host authentication failed; waiting for another transport";
-          return;
-        }
-        boolean won = false;
-        synchronized (connectionLock) {
-          synchronized (lifecycle) {
-            if (
-              invitation == expected &&
-              sessionEpoch == epoch &&
-              expected.valid() &&
-              "Participant".equals(role) &&
-              (channel == null ||
-                ("BLE".equals(transport) &&
-                  !"BLE".equals(offered.transport()))) &&
-              offered.accept()
-            ) {
-              SecureChannel previous = channel;
-              channel = authenticated;
-              if (previous != null) try {
-                previous.close();
-              } catch (Exception ignored) {}
-              connections.removeIf(ChannelTransport::isClosed);
-              connections.add(offered.connection());
-              transport = displayTransport(offered);
-              lanRoute = offered.route();
-              message = "Authenticated host connected";
-              won = true;
-              android.util.Log.i(
-                "MorpheJam",
-                "Authenticated transport=" +
-                  offered.transport() +
-                  " route=" +
-                  offered.route()
-              );
-            }
+        } finally {
+          if (!retained) {
+            if (authenticated != null) try {
+              authenticated.close();
+            } catch (Exception ignored) {}
+            offered.reject();
           }
         }
-        if (!won) {
-          try {
-            authenticated.close();
-          } catch (Exception ignored) {}
-          offered.reject();
-          return;
-        }
-        workers.execute(() -> sync(expected));
       });
     }
   };
@@ -718,6 +762,7 @@ public final class JamService extends Service {
     Invitation session,
     Nearby.ConnectionCandidate offered
   ) {
+    String participant = null;
     try (
       SecureChannel peer = new SecureChannel(
         connection,
@@ -736,12 +781,36 @@ public final class JamService extends Service {
           lanRoute = offered.route();
         }
         android.util.Log.i("MorpheJam", "Authenticated participant");
+        participant = peer.clientId;
+        participants
+          .computeIfAbsent(participant, id ->
+            new java.util.concurrent.atomic.AtomicInteger()
+          )
+          .incrementAndGet();
         message = "Participant authenticated";
       }
       while (invitation == session && session.valid()) {
         String request = peer.receive();
         JSONObject command = new JSONObject(request);
         String op = command.optString("op");
+        if ("CHANNEL".equals(op)) {
+          boolean allowed = false;
+          synchronized (serial) {
+            if (invitation == session && command.optInt("version") == 1) {
+              ChannelAuthority<SecureChannel> authority =
+                channelAuthorities.computeIfAbsent(peer.clientId, id ->
+                  new ChannelAuthority<>()
+                );
+              if ("BACKUP".equals(command.optString("role"))) allowed = true;
+              else if ("PRIMARY".equals(command.optString("role"))) allowed =
+                authority.promote(peer, command.optLong("epoch"));
+            }
+          }
+          peer.send(
+            new JSONObject().put("ok", allowed).put("version", 1).toString()
+          );
+          continue;
+        }
         if ("PING".equals(op)) {
           peer.send(ok().toString());
           continue;
@@ -791,7 +860,7 @@ public final class JamService extends Service {
           peer.send(error("Unsupported operation").toString());
           continue;
         }
-        peer.send(hostCall(command, peer.clientId, session).toString());
+        peer.send(hostCall(command, peer.clientId, session, peer).toString());
       }
     } catch (Exception e) {
       android.util.Log.i(
@@ -799,6 +868,15 @@ public final class JamService extends Service {
         "Participant disconnected: " + e.getClass().getSimpleName()
       );
     } finally {
+      if (participant != null) {
+        final String id = participant;
+        synchronized (lifecycle) {
+          if (invitation == session) participants.computeIfPresent(
+            id,
+            (key, count) -> count.decrementAndGet() == 0 ? null : count
+          );
+        }
+      }
       connections.remove(connection);
       try {
         connection.close();
@@ -812,7 +890,22 @@ public final class JamService extends Service {
     String client,
     Invitation expected
   ) throws Exception {
+    return hostCall(request, client, expected, null);
+  }
+
+  private JSONObject hostCall(
+    JSONObject request,
+    String client,
+    Invitation expected,
+    SecureChannel peer
+  ) throws Exception {
     synchronized (serial) {
+      ChannelAuthority<SecureChannel> authority = channelAuthorities.get(
+        client
+      );
+      if (
+        peer != null && authority != null && !authority.permits(peer)
+      ) return error("Channel is not primary");
       if (expected == null || invitation != expected) return error(
         "Jam session ended"
       );
@@ -911,7 +1004,11 @@ public final class JamService extends Service {
             sharedQueue == null ? "" : sharedQueue.optString("revision")
           )
       );
-      if (!value.optBoolean("ok") && !value.optBoolean("unchanged")) {
+      if (
+        !value.optBoolean("ok") &&
+        !value.optBoolean("unchanged") &&
+        !value.optBoolean("recovered")
+      ) {
         String failure = value.optString("error");
         synchronized (lifecycle) {
           if (invitation == expected && !failure.isEmpty()) message = failure;
@@ -939,6 +1036,7 @@ public final class JamService extends Service {
       return view();
     }
     if ("INVITE".equals(request.optString("op"))) {
+      Invitation currentInvite = invitation;
       String value = invite();
       if (value.isEmpty()) return error("Only the host can invite");
       com.google.zxing.common.BitMatrix bits =
@@ -972,7 +1070,10 @@ public final class JamService extends Service {
         );
       synchronized (lifecycle) {
         try {
-          if (!value.equals(invite())) return error("Jam session ended");
+          // Endpoint hints can refresh while the QR bitmap is being encoded.
+          if (
+            currentInvite == null || invitation != currentInvite
+          ) return error("Jam session ended");
           if (codePairing == null || !codePairing.valid()) {
             if (codePairing != null) codePairing.close();
             Invitation expected = invitation;
@@ -1049,6 +1150,12 @@ public final class JamService extends Service {
         }
         return value;
       } catch (Exception e) {
+        try {
+          activeChannel.close();
+        } catch (Exception ignored) {}
+        if (promoteBackup(current)) return error(
+          "Outcome unknown; refresh before editing. Backup promoted."
+        ).put("recovered", true);
         synchronized (lifecycle) {
           if (invitation != current) return error("Jam session ended");
           android.util.Log.w("MorpheJam", "Host channel failed", e);
@@ -1132,6 +1239,16 @@ public final class JamService extends Service {
     connections.clear();
     SecureChannel oldChannel = channel;
     channel = null;
+    WarmChannel oldBackup = backupChannel;
+    backupChannel = null;
+    if (oldBackup != null) {
+      try {
+        oldBackup.channel.close();
+      } catch (Exception ignored) {}
+      oldBackup.candidate.close();
+    }
+    channelAuthorities.clear();
+    participants.clear();
     if (oldChannel != null) try {
       oldChannel.close();
     } catch (Exception ignored) {}

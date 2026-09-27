@@ -47,7 +47,8 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
   private final Map<Long, Runnable> discoveryRetries = new HashMap<>();
   private final WifiManager.MulticastLock multicastLock;
   private LanProbe.Browser probeBrowser;
-  private boolean closed, legacyStarted;
+  private volatile boolean closed;
+  private boolean legacyStarted;
 
   LanBrowser(
     Context context,
@@ -68,6 +69,10 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
   }
 
   void start() {
+    if (Looper.myLooper() != Looper.getMainLooper()) {
+      handler.post(this::start);
+      return;
+    }
     if (closed || probeBrowser != null) return;
     probeBrowser = new LanProbe.Browser(
       context,
@@ -75,7 +80,10 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
       type,
       listener::onEndpoint
     );
-    probeBrowser.start();
+    if (
+      !TransportOptions.disabled(context, "GatewayProbe")
+    ) probeBrowser.start();
+    if (TransportOptions.disabled(context, "Nsd")) return;
     if (closed || nsd == null) {
       listener.onLanStatus("LAN discovery unavailable");
       return;
@@ -110,36 +118,49 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
       new NsdManager.DiscoveryListener() {
         @Override
         public void onDiscoveryStarted(String ignored) {
-          discoveryFailures.remove(handle);
-          listener.onLanStatus("LAN discovering");
+          handler.post(() -> {
+            if (closed || !currentDiscovery(handle, this)) return;
+            discoveryFailures.remove(handle);
+            listener.onLanStatus("LAN discovering");
+          });
         }
 
         @Override
         public void onDiscoveryStopped(String ignored) {
-          if (removeDiscovery(handle, this)) scheduleRetry(handle);
+          handler.post(() -> {
+            if (removeDiscovery(handle, this)) scheduleRetry(handle);
+          });
         }
 
         @Override
         public void onStartDiscoveryFailed(String ignored, int error) {
-          if (removeDiscovery(handle, this)) {
-            listener.onLanStatus("LAN discovery failed: " + error);
-            scheduleRetry(handle);
-          }
+          handler.post(() -> {
+            if (!closed && removeDiscovery(handle, this)) {
+              listener.onLanStatus("LAN discovery failed: " + error);
+              scheduleRetry(handle);
+            }
+          });
         }
 
         @Override
         public void onStopDiscoveryFailed(String ignored, int error) {
-          if (removeDiscovery(handle, this)) scheduleRetry(handle);
+          handler.post(() -> {
+            if (removeDiscovery(handle, this)) scheduleRetry(handle);
+          });
         }
 
         @Override
         public void onServiceLost(NsdServiceInfo info) {
-          lost(info, network);
+          handler.post(() -> {
+            if (!closed && currentDiscovery(handle, this)) lost(info, network);
+          });
         }
 
         @Override
         public void onServiceFound(NsdServiceInfo info) {
-          found(info, network);
+          handler.post(() -> {
+            if (!closed && currentDiscovery(handle, this)) found(info, network);
+          });
         }
       };
     try {
@@ -162,6 +183,14 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
       listener.onLanStatus("LAN discovery unavailable");
       scheduleRetry(handle);
     }
+  }
+
+  private boolean currentDiscovery(
+    long handle,
+    NsdManager.DiscoveryListener listener
+  ) {
+    Discovery current = discoveries.get(handle);
+    return current != null && current.listener == listener;
   }
 
   private boolean removeDiscovery(
@@ -209,17 +238,19 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
       new NsdManager.ServiceInfoCallback() {
         @Override
         public void onServiceInfoCallbackRegistrationFailed(int error) {
+          if (closed || callbacks.get(key) != this) return;
           callbacks.remove(key);
           resolve(info, network, 0);
         }
 
         @Override
         public void onServiceInfoCallbackUnregistered() {
-          callbacks.remove(key);
+          callbacks.remove(key, this);
         }
 
         @Override
         public void onServiceLost() {
+          if (closed || callbacks.get(key) != this) return;
           callbacks.remove(key);
           discoveredServices.remove(key);
           listener.onServiceLost(
@@ -230,7 +261,9 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
 
         @Override
         public void onServiceUpdated(NsdServiceInfo updated) {
-          if (!closed) listener.onEndpoint(LanEndpoint.from(updated, network));
+          if (!closed && callbacks.get(key) == this) listener.onEndpoint(
+            LanEndpoint.from(updated, network)
+          );
         }
       };
     callbacks.put(key, callback);
@@ -325,6 +358,10 @@ final class LanBrowser implements AutoCloseable, LocalNetworkTracker.Listener {
   @Override
   public void close() {
     closed = true;
+    if (Looper.myLooper() != Looper.getMainLooper()) {
+      handler.post(this::close);
+      return;
+    }
     tracker.removeListener(this);
     if (probeBrowser != null) probeBrowser.close();
     for (Runnable retry : discoveryRetries.values())

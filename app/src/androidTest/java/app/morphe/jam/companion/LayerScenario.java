@@ -95,6 +95,30 @@ final class LayerScenario {
 
   static void run(Instrumentation test, Bundle args) throws Exception {
     Context context = test.getTargetContext();
+    android.content.SharedPreferences.Editor controls = context
+      .getSharedPreferences("transport-test", 0)
+      .edit()
+      .clear();
+    for (String provider : new String[] {
+      "InviteHints",
+      "Nsd",
+      "GatewayProbe",
+      "Ipv4Broadcast",
+      "Ipv6Multicast",
+      "ActiveProbe",
+      "Aware",
+      "Ble",
+    })
+      controls.putBoolean(
+        "disable" + provider,
+        "true".equals(args.getString("disable" + provider))
+      );
+    controls
+      .putInt(
+        "activeProbeDelayMs",
+        Integer.parseInt(args.getString("activeProbeDelayMs", "2000"))
+      )
+      .commit();
     // Wiped test installation has no user pairing. Supply only a temporary start capability.
     check(
       !context.getSharedPreferences("pair", 0).contains("package"),
@@ -140,6 +164,18 @@ final class LayerScenario {
       String mode = args.getString("transport", "LAN");
       if ("layerHost".equals(role)) {
         service.host(mode);
+        await(
+          () -> {
+            try {
+              return field("nearby").get(service) != null;
+            } catch (Exception e) {
+              return false;
+            }
+          },
+          5000,
+          "Host listener unavailable"
+        );
+        test.runOnMainSync(() -> {});
         JSONObject invite = service.dispatch(command("INVITE"));
         Files.write(
           context.getFilesDir().toPath().resolve("layer-invite.txt"),
@@ -178,6 +214,27 @@ final class LayerScenario {
           "Host not connected: " + service.state()
         );
         long connected = SystemClock.elapsedRealtime() - started;
+        Nearby nearby = (Nearby) field("nearby").get(service);
+        String timeline = nearby.diagnostics.snapshot().toString();
+        String expectedSource = args.getString("expectedSource", "");
+        if (!expectedSource.isEmpty()) {
+          boolean found = false;
+          JSONArray events = nearby.diagnostics.snapshot();
+          for (int n = 0; n < events.length(); n++) {
+            JSONObject event = events.getJSONObject(n);
+            if (
+              "AUTH_SUCCESS".equals(event.optString("event")) &&
+              expectedSource.equals(event.optString("source"))
+            ) found = true;
+          }
+          check(
+            found,
+            "Expected discovery source " + expectedSource + ": " + timeline
+          );
+        }
+        Bundle timing = new Bundle();
+        timing.putString("stream", "JOIN " + mode + " ms=" + connected + "\n");
+        test.sendStatus(0, timing);
         JSONObject snapshot = service.dispatch(command("SNAPSHOT"));
         check(
           snapshot.optBoolean("ok") &&
@@ -198,7 +255,46 @@ final class LayerScenario {
           "Host state did not converge"
         );
         SecureChannel previous = (SecureChannel) field("channel").get(service);
+        boolean warm = "true".equals(args.getString("warmBackup"));
+        String originalTransport = service.state().optString("transport");
+        if (warm) {
+          await(
+            () ->
+              !"None".equals(
+                service.state().optString("backupTransport", "None")
+              ),
+            30000,
+            "Authenticated backup unavailable"
+          );
+          check(
+            !originalTransport.equals(
+              service.state().optString("backupTransport")
+            ),
+            "Backup must be a distinct transport"
+          );
+          synchronized (field("backupLock").get(service)) {
+            Object backup = field("backupChannel").get(service);
+            Field secure = backup.getClass().getDeclaredField("channel");
+            secure.setAccessible(true);
+            SecureChannel standby = (SecureChannel) secure.get(backup);
+            standby.send(command("PLAY").put("playing", false).toString());
+            check(!new JSONObject(standby.receive()).optBoolean("ok"), "Backup channel was allowed to mutate host state");
+          }
+          int hold = Math.min(
+            65000,
+            Integer.parseInt(args.getString("holdBackupMs", "0"))
+          );
+          if (hold > 0) Thread.sleep(hold);
+          check(
+            !"None".equals(
+              service.state().optString("backupTransport", "None")
+            ),
+            "Backup expired during keepalive test"
+          );
+        }
+        long recoveryStarted = SystemClock.elapsedRealtime();
         previous.close();
+        if (warm) service.dispatch(command("SNAPSHOT"));
         await(
           () -> {
             try {
@@ -215,6 +311,23 @@ final class LayerScenario {
           service.dispatch(command("SNAPSHOT")).optBoolean("ok"),
           "Recovered snapshot failed"
         );
+        if (warm) {
+          check(
+            !originalTransport.equals(service.state().optString("transport")),
+            "Backup was not promoted"
+          );
+          check(
+            SystemClock.elapsedRealtime() - recoveryStarted < 3000,
+            "Backup promotion exceeded 3 seconds"
+          );
+          check(
+            service
+              .dispatch(command("SNAPSHOT"))
+              .getJSONObject("clock")
+              .getBoolean("playing"),
+            "Backup promotion lost host state"
+          );
+        }
         Bundle progress = new Bundle();
         progress.putString(
           "stream",
@@ -222,6 +335,8 @@ final class LayerScenario {
             mode +
             " join=" +
             connected +
+            "ms reconnect=" +
+            (SystemClock.elapsedRealtime() - recoveryStarted) +
             "ms, command, duplicate, snapshot, reconnect\n"
         );
         test.sendStatus(0, progress);

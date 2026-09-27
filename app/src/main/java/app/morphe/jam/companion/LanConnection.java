@@ -13,6 +13,64 @@ final class LanConnection {
 
   private LanConnection() {}
 
+  /** Owns sockets from creation, including those still blocked in connect(). */
+  static final class Attempt implements AutoCloseable {
+
+    private final Set<Socket> sockets = new HashSet<>();
+    private boolean closed;
+
+    synchronized void add(Socket socket) throws IOException {
+      if (closed) {
+        socket.close();
+        throw new SocketException("Candidate cancelled");
+      }
+      sockets.add(socket);
+    }
+
+    synchronized void detach(Socket socket) {
+      sockets.remove(socket);
+    }
+
+    public void close() {
+      List<Socket> cancel;
+      synchronized (this) {
+        closed = true;
+        cancel = new ArrayList<>(sockets);
+        sockets.clear();
+      }
+      for (Socket socket : cancel)
+        try {
+          socket.close();
+        } catch (IOException ignored) {}
+    }
+
+    SocketFactory wrap(SocketFactory factory) {
+      return new SocketFactory() {
+        public Socket createSocket() throws IOException {
+          Socket socket = factory.createSocket();
+          add(socket);
+          return socket;
+        }
+
+        public Socket createSocket(String h, int p) {
+          throw new UnsupportedOperationException();
+        }
+
+        public Socket createSocket(String h, int p, InetAddress a, int l) {
+          throw new UnsupportedOperationException();
+        }
+
+        public Socket createSocket(InetAddress h, int p) {
+          throw new UnsupportedOperationException();
+        }
+
+        public Socket createSocket(InetAddress h, int p, InetAddress a, int l) {
+          throw new UnsupportedOperationException();
+        }
+      };
+    }
+  }
+
   enum Route {
     BOUND_ENDPOINT_NETWORK,
     BOUND_PHYSICAL_FALLBACK,
@@ -47,6 +105,15 @@ final class LanConnection {
     LocalNetworkTracker.Snapshot topology,
     int timeoutMillis
   ) throws IOException {
+    return connect(endpoint, topology, timeoutMillis, new Attempt());
+  }
+
+  static Result connect(
+    LanEndpoint endpoint,
+    LocalNetworkTracker.Snapshot topology,
+    int timeoutMillis,
+    Attempt lifetime
+  ) throws IOException {
     long deadline = deadline(timeoutMillis);
     List<IOException> failures = new ArrayList<>();
     if (endpoint.network != null) {
@@ -54,7 +121,7 @@ final class LanConnection {
         endpoint.addresses,
         endpoint.port,
         deadline,
-        endpoint.network.getSocketFactory(),
+        lifetime.wrap(endpoint.network.getSocketFactory()),
         failures
       );
       if (socket != null) return new Result(
@@ -67,7 +134,7 @@ final class LanConnection {
           endpoint.addresses,
           endpoint.port,
           deadline,
-          SocketFactory.getDefault(),
+          lifetime.wrap(SocketFactory.getDefault()),
           failures
         );
         if (socket != null) return new Result(
@@ -81,7 +148,7 @@ final class LanConnection {
           endpoint.addresses,
           endpoint.port,
           deadline,
-          network.getSocketFactory(),
+          lifetime.wrap(network.getSocketFactory()),
           failures
         );
         if (socket != null) return new Result(
@@ -94,7 +161,7 @@ final class LanConnection {
         endpoint.addresses,
         endpoint.port,
         deadline,
-        SocketFactory.getDefault(),
+        lifetime.wrap(SocketFactory.getDefault()),
         failures
       );
       if (socket != null) return new Result(

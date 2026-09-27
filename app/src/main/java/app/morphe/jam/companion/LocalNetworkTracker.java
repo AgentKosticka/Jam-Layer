@@ -42,6 +42,8 @@ final class LocalNetworkTracker implements AutoCloseable {
   private final Handler handler = new Handler(Looper.getMainLooper());
   private final Object lock = new Object();
   private final Map<Long, Network> locals = new HashMap<>();
+  private final Map<Long, String> links = new HashMap<>();
+  private String lastTopology = "";
   private final Set<Network> vpns = new HashSet<>();
   private final Set<Listener> listeners = new HashSet<>();
   private Network defaultNetwork;
@@ -66,6 +68,18 @@ final class LocalNetworkTracker implements AutoCloseable {
       public void onLost(Network network) {
         synchronized (lock) {
           locals.remove(network.getNetworkHandle());
+          links.remove(network.getNetworkHandle());
+        }
+        publish();
+      }
+
+      @Override
+      public void onLinkPropertiesChanged(
+        Network network,
+        android.net.LinkProperties properties
+      ) {
+        synchronized (lock) {
+          links.put(network.getNetworkHandle(), properties.toString());
         }
         publish();
       }
@@ -156,6 +170,7 @@ final class LocalNetworkTracker implements AutoCloseable {
         .build();
       connectivity.registerNetworkCallback(vpn, vpnCallback, handler);
       connectivity.registerDefaultNetworkCallback(defaultCallback, handler);
+      defaultNetwork = connectivity.getActiveNetwork();
       for (Network network : connectivity.getAllNetworks()) {
         NetworkCapabilities caps = connectivity.getNetworkCapabilities(network);
         if (caps != null) {
@@ -222,7 +237,17 @@ final class LocalNetworkTracker implements AutoCloseable {
           caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
       ) {
         locals.put(network.getNetworkHandle(), network);
-      } else locals.remove(network.getNetworkHandle());
+        android.net.LinkProperties properties = connectivity.getLinkProperties(
+          network
+        );
+        if (properties != null) links.put(
+          network.getNetworkHandle(),
+          properties.toString()
+        );
+      } else {
+        locals.remove(network.getNetworkHandle());
+        links.remove(network.getNetworkHandle());
+      }
     }
     publish();
   }
@@ -232,6 +257,20 @@ final class LocalNetworkTracker implements AutoCloseable {
     final List<Listener> targets;
     synchronized (lock) {
       if (closed) return;
+      List<Long> physical = new ArrayList<>(locals.keySet());
+      Collections.sort(physical);
+      List<Long> tunnels = new ArrayList<>();
+      for (Network network : vpns) tunnels.add(network.getNetworkHandle());
+      Collections.sort(tunnels);
+      StringBuilder topology = new StringBuilder(physical.toString())
+        .append(tunnels)
+        .append(
+          defaultNetwork == null ? -1 : defaultNetwork.getNetworkHandle()
+        );
+      for (Long handle : physical) topology.append(links.get(handle));
+      String signature = topology.toString();
+      if (signature.equals(lastTopology)) return;
+      lastTopology = signature;
       snapshot = new Snapshot(
         new ArrayList<>(locals.values()),
         !vpns.isEmpty(),
@@ -250,6 +289,7 @@ final class LocalNetworkTracker implements AutoCloseable {
       closed = true;
       listeners.clear();
       locals.clear();
+      links.clear();
       vpns.clear();
     }
     if (connectivity != null && started) {

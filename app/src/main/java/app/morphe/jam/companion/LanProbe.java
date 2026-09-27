@@ -67,7 +67,10 @@ final class LanProbe {
         try {
           DatagramSocket socket = new DatagramSocket(PORT);
           server = socket;
-          Thread thread = new Thread(() -> serve(socket), "Jam LAN gateway probe");
+          Thread thread = new Thread(
+            () -> serve(socket),
+            "Jam LAN gateway probe"
+          );
           thread.setDaemon(true);
           thread.start();
         } catch (Exception error) {
@@ -108,7 +111,9 @@ final class LanProbe {
         String type = query.substring((MAGIC + " ").length());
         Service[] matching;
         synchronized (lock) {
-          matching = services.values().stream()
+          matching = services
+            .values()
+            .stream()
             .filter(value -> value.type.equals(type))
             .toArray(Service[]::new);
         }
@@ -124,7 +129,11 @@ final class LanProbe {
           );
         }
       } catch (Exception error) {
-        if (!socket.isClosed()) Log.w("MorpheJam", "LAN gateway probe failed", error);
+        if (!socket.isClosed()) Log.w(
+          "MorpheJam",
+          "LAN gateway probe failed",
+          error
+        );
       }
     }
   }
@@ -184,9 +193,15 @@ final class LanProbe {
               !gateway.isAnyLocalAddress()
             ) try (DatagramSocket socket = new DatagramSocket()) {
               network.bindSocket(socket);
-              socket.send(new DatagramPacket(reply, reply.length, gateway, PORT));
+              socket.send(
+                new DatagramPacket(reply, reply.length, gateway, PORT)
+              );
             } catch (Exception error) {
-              if (!closed) Log.d("MorpheJam", "LAN gateway announce skipped", error);
+              if (!closed) Log.d(
+                "MorpheJam",
+                "LAN gateway announce skipped",
+                error
+              );
             }
           }
         }
@@ -227,9 +242,9 @@ final class LanProbe {
       String type,
       Listener listener
     ) {
-      connectivity = context.getApplicationContext().getSystemService(
-        ConnectivityManager.class
-      );
+      connectivity = context
+        .getApplicationContext()
+        .getSystemService(ConnectivityManager.class);
       this.tracker = tracker;
       this.type = type;
       this.listener = listener;
@@ -294,35 +309,45 @@ final class LanProbe {
     }
 
     private void listen() {
-      while (!closed) try (DatagramSocket socket = new DatagramSocket(null)) {
-        // Publish before binding so close() can also cancel a starting listener.
-        listenSocket = socket;
-        if (closed) return;
-        socket.bind(new InetSocketAddress(PORT));
-        socket.setSoTimeout(1000);
-        while (!closed) {
-          byte[] buffer = new byte[256];
-          DatagramPacket announcement = new DatagramPacket(buffer, buffer.length);
+      while (!closed)
+        try (DatagramSocket socket = new DatagramSocket(null)) {
+          // Publish before binding so close() can also cancel a starting listener.
+          listenSocket = socket;
+          if (closed) return;
+          socket.bind(new InetSocketAddress(PORT));
+          socket.setSoTimeout(1000);
+          while (!closed) {
+            byte[] buffer = new byte[256];
+            DatagramPacket announcement = new DatagramPacket(
+              buffer,
+              buffer.length
+            );
+            try {
+              socket.receive(announcement);
+              if (onLocalNetwork(announcement.getAddress())) deliver(
+                announcement,
+                null
+              );
+            } catch (java.net.SocketTimeoutException ignored) {}
+          }
+        } catch (java.net.BindException busy) {
+          // Pairing and session discovery can briefly overlap during handoff.
+          // Retry until the previous listener releases the shared discovery port.
           try {
-            socket.receive(announcement);
-            if (onLocalNetwork(announcement.getAddress()))
-              deliver(announcement, null);
-          } catch (java.net.SocketTimeoutException ignored) {}
-        }
-      } catch (java.net.BindException busy) {
-        // Pairing and session discovery can briefly overlap during handoff.
-        // Retry until the previous listener releases the shared discovery port.
-        try {
-          Thread.sleep(200);
-        } catch (InterruptedException stopped) {
+            Thread.sleep(200);
+          } catch (InterruptedException stopped) {
+            return;
+          }
+        } catch (Exception error) {
+          if (!closed) Log.d(
+            "MorpheJam",
+            "LAN gateway listener unavailable",
+            error
+          );
           return;
+        } finally {
+          listenSocket = null;
         }
-      } catch (Exception error) {
-        if (!closed) Log.d("MorpheJam", "LAN gateway listener unavailable", error);
-        return;
-      } finally {
-        listenSocket = null;
-      }
     }
 
     private boolean onLocalNetwork(InetAddress source) {
@@ -386,8 +411,11 @@ final class LanProbe {
           port,
           attrs
         );
+        final LanEndpoint discovered = endpoint.withSource(
+          DiscoverySource.UDP_GATEWAY
+        );
         handler.post(() -> {
-          if (!closed) listener.onEndpoint(endpoint);
+          if (!closed) listener.onEndpoint(discovered);
         });
       } catch (RuntimeException malformed) {
         // Ignore unrelated UDP traffic on the probe port.

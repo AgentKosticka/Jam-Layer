@@ -17,6 +17,7 @@ public final class Nearby implements AutoCloseable {
     void status(String message);
 
     default void state(String lanState, String awareState, boolean vpnActive) {}
+
     default void bleState(String state) {}
   }
 
@@ -81,6 +82,12 @@ public final class Nearby implements AutoCloseable {
       return true;
     }
 
+    public synchronized boolean acceptBackup() {
+      if (state != State.PENDING || !owner.acceptBackup(this)) return false;
+      state = State.ACCEPTED;
+      return true;
+    }
+
     public synchronized void reject() {
       if (state == State.PENDING) {
         state = State.REJECTED;
@@ -135,9 +142,14 @@ public final class Nearby implements AutoCloseable {
   private final LocalNetworkTracker topology;
   private final LocalNetworkTracker.Listener topologyListener;
   private final Map<String, LanEndpoint> endpoints = new HashMap<>();
+  private final ConnectionCandidateManager history =
+    new ConnectionCandidateManager();
+  final TransportDiagnostics diagnostics = new TransportDiagnostics();
   private final Map<String, Integer> lanRetries = new HashMap<>();
   private final Map<String, Integer> authenticationRetries = new HashMap<>();
   private final Set<String> lanConnecting = new HashSet<>();
+  private final Map<String, LanConnection.Attempt> lanAttempts =
+    new HashMap<>();
   private final Set<ConnectionCandidate> candidates =
     ConcurrentHashMap.newKeySet();
   private final Map<PeerHandle, AwareDataPath> paths =
@@ -152,6 +164,7 @@ public final class Nearby implements AutoCloseable {
   private final Runnable checkAwareDiscovery = this::checkAwareDiscovery;
   private LanAdvertiser advertiser;
   private LanBrowser browser;
+  private LanDiscovery localDiscovery;
   private BleNearby ble;
   private boolean pairedBleActive;
   private final Runnable startBle = this::startBle;
@@ -166,7 +179,71 @@ public final class Nearby implements AutoCloseable {
   private volatile boolean closed;
   private volatile LocalNetworkTracker.Snapshot snapshot;
   private volatile ConnectionCandidate winner;
-  private volatile String lanState = "idle", awareState = "idle";
+  private volatile ConnectionCandidate backup;
+
+  private boolean wants(String transport) {
+    if (closed) return false;
+    ConnectionCandidate primary = winner;
+    if (host || primary == null) return true;
+    if ("BLE".equals(primary.transport())) return !"BLE".equals(transport);
+    return (
+      "Auto".equals(preference) &&
+      backup == null &&
+      !"BLE".equals(transport) &&
+      !transport.equals(primary.transport())
+    );
+  }
+
+  private synchronized boolean acceptBackup(ConnectionCandidate candidate) {
+    if (
+      !wants(candidate.transport()) || winner == null || backup != null
+    ) return false;
+    backup = candidate;
+    handler.post(() -> {
+      if (closed || backup != candidate) return;
+      cancelLanAttempts();
+      if (candidate.endpoint != null) history.success(
+        history.observe(
+          candidate.endpoint.candidateKey(),
+          candidate.endpoint.source,
+          SystemClock.elapsedRealtime()
+        ),
+        SystemClock.elapsedRealtime()
+      );
+      diagnostics.event(
+        "BACKUP_READY_" + candidate.transport(),
+        candidate.endpoint,
+        0,
+        ""
+      );
+      for (ConnectionCandidate other : new ArrayList<>(candidates))
+        if (other != winner && other != backup) other.close();
+      publishState();
+    });
+    return true;
+  }
+
+  void promoteBackup(ConnectionCandidate candidate) {
+    ConnectionCandidate previous;
+    synchronized (this) {
+      if (closed || backup != candidate) return;
+      previous = winner;
+      winner = candidate;
+      backup = null;
+    }
+    if (previous != null) previous.close();
+    handler.post(() -> {
+      finishAccepted(candidate);
+      onTopologyChanged();
+      if (wants("Aware")) {
+        closeAware();
+        startAware();
+      }
+    });
+  }
+
+  private volatile String lanState = "idle",
+    awareState = "idle";
 
   public Nearby(
     Context context,
@@ -197,10 +274,32 @@ public final class Nearby implements AutoCloseable {
       if (closed) return;
       topology.start();
       topology.addListener(topologyListener);
+      diagnostics.event(host ? "HOST_STARTED" : "JOIN_STARTED", null, 0, "");
       if (!"Aware".equals(preference) && !"BLE".equals(preference)) startLan();
       if (!"LAN".equals(preference) && !"BLE".equals(preference)) startAware();
       scheduleBle();
     });
+  }
+
+  /** Pairing already owns its path through ChannelTransport; use normal arbitration. */
+  void pairedConnection(
+    ChannelTransport connection,
+    String transport,
+    String route
+  ) {
+    handler.post(() ->
+      deliver(
+        new ConnectionCandidate(
+          this,
+          connection,
+          transport,
+          route,
+          awareGeneration,
+          null,
+          null
+        )
+      )
+    );
   }
 
   private boolean strongWinner() {
@@ -209,14 +308,17 @@ public final class Nearby implements AutoCloseable {
 
   private void scheduleBle() {
     handler.removeCallbacks(startBle);
-    if ("Auto".equals(preference) || "BLE".equals(preference))
-      handler.postDelayed(startBle, bleDelay(context, preference));
+    if (TransportOptions.disabled(context, "Ble")) return;
+    if (
+      "Auto".equals(preference) || "BLE".equals(preference)
+    ) handler.postDelayed(startBle, bleDelay(context, preference));
   }
 
   static long bleDelay(Context context, String mode) {
     if ("BLE".equals(mode)) return 0;
-    android.net.wifi.WifiManager wifi = context.getApplicationContext()
-        .getSystemService(android.net.wifi.WifiManager.class);
+    android.net.wifi.WifiManager wifi = context
+      .getApplicationContext()
+      .getSystemService(android.net.wifi.WifiManager.class);
     // No reason to wait for Wi-Fi when it is switched off. Keep the existing
     // audio-route guard and upgrade BLE when a faster transport authenticates.
     if (wifi == null || !wifi.isWifiEnabled()) return 0;
@@ -225,14 +327,32 @@ public final class Nearby implements AutoCloseable {
 
   private void startBle() {
     if (closed || pairedBleActive || (!host && winner != null)) return;
-    if (ble == null) ble = new BleNearby(context, invite, host, new BleNearby.Listener() {
-      public void connected(ChannelTransport connection) {
-        handler.post(() -> deliver(new ConnectionCandidate(
-          Nearby.this, connection, "BLE", "BLE_L2CAP", 0, null, null
-        )));
+    if (ble == null) ble = new BleNearby(
+      context,
+      invite,
+      host,
+      new BleNearby.Listener() {
+        public void connected(ChannelTransport connection) {
+          handler.post(() ->
+            deliver(
+              new ConnectionCandidate(
+                Nearby.this,
+                connection,
+                "BLE",
+                "BLE_L2CAP",
+                0,
+                null,
+                null
+              )
+            )
+          );
+        }
+
+        public void state(String state) {
+          listener.bleState(state);
+        }
       }
-      public void state(String state) { listener.bleState(state); }
-    });
+    );
     ble.start();
   }
 
@@ -270,6 +390,17 @@ public final class Nearby implements AutoCloseable {
       publishState();
       return;
     }
+    if (localDiscovery == null) {
+      localDiscovery = new LanDiscovery(
+        context,
+        topology,
+        invite.jamId,
+        host ? port : 0,
+        () -> !wants("LAN"),
+        this::discoverLan
+      );
+      localDiscovery.start();
+    }
     if (host) {
       advertiser = new LanAdvertiser(
         context,
@@ -297,7 +428,7 @@ public final class Nearby implements AutoCloseable {
             if (
               id != null &&
               invite.jamId.equals(new String(id, StandardCharsets.UTF_8))
-            ) connectLan(endpoint);
+            ) discoverLan(endpoint);
           }
 
           @Override
@@ -314,9 +445,8 @@ public final class Nearby implements AutoCloseable {
                 endpoint.serviceName.equals(name) &&
                 endpoint.discoveryHandle == handle
               ) {
-                lanRetries.remove(endpoint.fingerprint);
-                authenticationRetries.remove(endpoint.fingerprint);
-                lanConnecting.remove(endpoint.fingerprint);
+                lanRetries.remove(endpoint.candidateKey());
+                authenticationRetries.remove(endpoint.candidateKey());
                 it.remove();
               }
             }
@@ -343,41 +473,176 @@ public final class Nearby implements AutoCloseable {
 
   private void onTopologyChanged() {
     if (closed) return;
-    for (LanEndpoint endpoint : new ArrayList<>(endpoints.values()))
+    Set<Long> liveNetworks = new HashSet<>();
+    for (Network network : snapshot.localNetworks)
+      liveNetworks.add(network.getNetworkHandle());
+    for (LanEndpoint endpoint : new ArrayList<>(endpoints.values())) {
       if (
-        !lanConnecting.contains(endpoint.fingerprint) &&
-        lanRetries.getOrDefault(endpoint.fingerprint, 0) < 4 &&
-        authenticationRetries.getOrDefault(endpoint.fingerprint, 0) <= 3
-      ) connectLan(endpoint);
+        endpoint.network != null &&
+        !liveNetworks.contains(endpoint.networkHandle)
+      ) {
+        endpoints.remove(endpoint.candidateKey());
+        LanConnection.Attempt attempt = lanAttempts.remove(
+          endpoint.candidateKey()
+        );
+        if (attempt != null) attempt.close();
+      }
+    }
+    if (
+      host &&
+      port > 0 &&
+      !"Aware".equals(preference) &&
+      !"BLE".equals(preference)
+    ) {
+      List<Invitation.Hint> hints = new ArrayList<>();
+      for (Network network : snapshot.localNetworks) {
+        LinkProperties properties = connectivity.getLinkProperties(network);
+        if (properties == null) continue;
+        for (LinkAddress link : properties.getLinkAddresses()) {
+          java.net.InetAddress address = link.getAddress();
+          if (
+            address instanceof java.net.Inet4Address &&
+            (address.isSiteLocalAddress() || address.isLinkLocalAddress())
+          ) hints.add(new Invitation.Hint(address, port));
+        }
+      }
+      invite.setHints(hints);
+    }
+    if (
+      !host &&
+      !"Aware".equals(preference) &&
+      !"BLE".equals(preference) &&
+      !TransportOptions.disabled(context, "InviteHints")
+    ) {
+      for (Invitation.Hint hint : invite.hints) {
+        LanEndpoint endpoint = new LanEndpoint(
+          "invite",
+          "_morphejam._tcp.",
+          null,
+          Collections.singletonList(hint.address),
+          hint.port,
+          attrs()
+        );
+        endpoint = endpoint.withSource(DiscoverySource.INVITE_HINT);
+        discoverLan(endpoint);
+      }
+    }
+    List<LanEndpoint> remembered = new ArrayList<>(endpoints.values());
+    remembered.sort(
+      Comparator.comparingLong(endpoint ->
+        history.score(endpoint.candidateKey())
+      )
+    );
+    for (LanEndpoint endpoint : remembered)
+      if (
+        !lanConnecting.contains(endpoint.candidateKey()) &&
+        lanRetries.getOrDefault(endpoint.candidateKey(), 0) < 4 &&
+        authenticationRetries.getOrDefault(endpoint.candidateKey(), 0) <= 3
+      ) discoverLan(endpoint);
+  }
+
+  private void discoverLan(LanEndpoint endpoint) {
+    if (closed || endpoint.port < 1 || endpoint.port > 65535) return;
+    int stagger = 0;
+    for (java.net.InetAddress address : endpoint.addresses) {
+      if (
+        address == null ||
+        address.isAnyLocalAddress() ||
+        address.isMulticastAddress()
+      ) continue;
+      if (
+        endpoint.network == null &&
+        snapshot != null &&
+        !snapshot.localNetworks.isEmpty()
+      ) {
+        for (Network network : snapshot.localNetworks) {
+          LanEndpoint target = endpoint.single(network, address);
+          handler.postDelayed(() -> connectLan(target), stagger++ * 100L);
+        }
+      } else {
+        LanEndpoint target = endpoint.single(endpoint.network, address);
+        handler.postDelayed(() -> connectLan(target), stagger++ * 100L);
+      }
+    }
   }
 
   private void connectLan(LanEndpoint endpoint) {
+    if (closed) return;
     if (
-      closed || strongWinner() ||
-      authenticationRetries.getOrDefault(endpoint.fingerprint, 0) > 3 ||
-      lanConnecting.contains(endpoint.fingerprint)
+      endpoint.network != null &&
+      snapshot != null &&
+      !snapshot.localNetworks.contains(endpoint.network)
     ) return;
-    endpoints.put(endpoint.fingerprint, endpoint);
-    lanConnecting.add(endpoint.fingerprint);
+    ConnectionCandidateManager.Record record = history.observe(
+      endpoint.candidateKey(),
+      endpoint.source,
+      SystemClock.elapsedRealtime()
+    );
+    if (
+      closed ||
+      !wants("LAN") ||
+      authenticationRetries.getOrDefault(endpoint.candidateKey(), 0) > 3 ||
+      lanConnecting.contains(endpoint.candidateKey())
+    ) return;
+    if (
+      lanConnecting.size() >= 8 ||
+      (endpoints.size() >= 256 &&
+        !endpoints.containsKey(endpoint.candidateKey()))
+    ) return;
+    if (!history.begin(record, SystemClock.elapsedRealtime())) return;
+    diagnostics.event("CONNECT_STARTED", endpoint, 0, "");
+    endpoints.put(endpoint.candidateKey(), endpoint);
+    lanConnecting.add(endpoint.candidateKey());
     lanState = "connecting";
     publishState();
+    LanConnection.Attempt lifetime = new LanConnection.Attempt();
+    lanAttempts.put(endpoint.candidateKey(), lifetime);
     workers.execute(() -> {
       try {
         LanConnection.Result result = LanConnection.connect(
           endpoint,
           snapshot,
-          5000
+          5000,
+          lifetime
         );
-        if (closed || strongWinner()) {
-          try { result.socket.close(); } catch (Exception ignored) {}
+        if (closed || !wants("LAN")) {
+          try {
+            result.socket.close();
+          } catch (Exception ignored) {}
+          handler.post(() -> {
+            if (lanAttempts.get(endpoint.candidateKey()) == lifetime) {
+              lanAttempts.remove(endpoint.candidateKey());
+              lanConnecting.remove(endpoint.candidateKey());
+              history.release(record);
+            }
+          });
           return;
         }
         handler.post(() -> {
-          if (closed || strongWinner()) {
-            try { result.socket.close(); } catch (Exception ignored) {}
+          if (lanAttempts.get(endpoint.candidateKey()) != lifetime) {
+            try {
+              result.socket.close();
+            } catch (Exception ignored) {}
             return;
           }
-          lanRetries.remove(endpoint.fingerprint);
+          lanAttempts.remove(endpoint.candidateKey());
+          if (closed || !wants("LAN")) {
+            try {
+              result.socket.close();
+            } catch (Exception ignored) {}
+            lanConnecting.remove(endpoint.candidateKey());
+            history.release(record);
+            return;
+          }
+          history.authenticating(record, SystemClock.elapsedRealtime());
+          lifetime.detach(result.socket);
+          diagnostics.event(
+            "AUTH_STARTED",
+            endpoint,
+            record.lastConnectDurationMs,
+            ""
+          );
+          lanRetries.remove(endpoint.candidateKey());
           lanState = "connected";
           publishState();
           try {
@@ -393,22 +658,54 @@ public final class Nearby implements AutoCloseable {
               )
             );
           } catch (Exception error) {
-            try { result.socket.close(); } catch (Exception ignored) {}
+            try {
+              result.socket.close();
+            } catch (Exception ignored) {}
             lanFailed(endpoint, error);
           }
         });
       } catch (Exception error) {
-        handler.post(() -> lanFailed(endpoint, error));
-      } finally {
-        handler.post(() -> lanConnecting.remove(endpoint.fingerprint));
+        handler.post(() -> {
+          if (lanAttempts.get(endpoint.candidateKey()) != lifetime) return;
+          lanAttempts.remove(endpoint.candidateKey());
+          lanFailed(endpoint, error);
+        });
       }
     });
   }
 
+  private void cancelLanAttempts() {
+    for (Map.Entry<
+      String,
+      LanConnection.Attempt
+    > entry : lanAttempts.entrySet()) {
+      entry.getValue().close();
+      lanConnecting.remove(entry.getKey());
+      LanEndpoint endpoint = endpoints.get(entry.getKey());
+      if (endpoint != null) history.release(
+        history.observe(
+          entry.getKey(),
+          endpoint.source,
+          SystemClock.elapsedRealtime()
+        )
+      );
+    }
+    lanAttempts.clear();
+  }
+
   private void lanFailed(LanEndpoint endpoint, Exception error) {
-    if (closed || strongWinner()) return;
-    int attempt = lanRetries.getOrDefault(endpoint.fingerprint, 0) + 1;
-    lanRetries.put(endpoint.fingerprint, attempt);
+    lanConnecting.remove(endpoint.candidateKey());
+    ConnectionCandidateManager.Record record = history.observe(
+      endpoint.candidateKey(),
+      endpoint.source,
+      SystemClock.elapsedRealtime()
+    );
+    String failure = TransportFailure.classify(error).name();
+    if (record != null) history.failure(record, failure);
+    diagnostics.event("CONNECT_FAILED", endpoint, 0, failure);
+    if (closed || !wants("LAN")) return;
+    int attempt = lanRetries.getOrDefault(endpoint.candidateKey(), 0) + 1;
+    lanRetries.put(endpoint.candidateKey(), attempt);
     boolean vpn = vpnActive();
     lanState =
       vpn && snapshot != null && snapshot.localNetworks.isEmpty()
@@ -434,6 +731,7 @@ public final class Nearby implements AutoCloseable {
   }
 
   private void startAware() {
+    if (TransportOptions.disabled(context, "Aware")) return;
     if (Build.VERSION.SDK_INT < 29) {
       awareState = "requires Android 10";
       publishState();
@@ -486,13 +784,13 @@ public final class Nearby implements AutoCloseable {
   }
 
   private boolean canConnectAware(int generation) {
-    return activeAware(generation) && (host || !strongWinner());
+    return activeAware(generation) && wants("Aware");
   }
 
   private void attachAware() {
     WifiAwareManager manager = awareManager;
     if (
-      closed || strongWinner() || attaching || aware != null || manager == null
+      closed || !wants("Aware") || attaching || aware != null || manager == null
     ) return;
     if (!manager.isAvailable()) {
       awareState = "unavailable; waiting";
@@ -581,8 +879,11 @@ public final class Nearby implements AutoCloseable {
                   awarePeerSeen = true;
                   handler.removeCallbacks(checkAwareDiscovery);
                   knownAwarePeers.add(peer);
-                  if (canConnectAware(generation))
-                    sendAwareMessage(peer, invite.jamId, generation);
+                  if (canConnectAware(generation)) sendAwareMessage(
+                    peer,
+                    invite.jamId,
+                    generation
+                  );
                 }
               }
 
@@ -593,11 +894,12 @@ public final class Nearby implements AutoCloseable {
                 if (host && invite.jamId.equals(value)) {
                   requestPath(peer, generation);
                   sendAwareMessage(peer, "OK:" + invite.jamId, generation);
-                } else if (
-                  !host && ("OK:" + invite.jamId).equals(value)
-                ) {
+                } else if (!host && ("OK:" + invite.jamId).equals(value)) {
                   knownAwarePeers.add(peer);
-                  if (canConnectAware(generation)) requestPath(peer, generation);
+                  if (canConnectAware(generation)) requestPath(
+                    peer,
+                    generation
+                  );
                 }
               }
 
@@ -654,14 +956,14 @@ public final class Nearby implements AutoCloseable {
   /** Some vendor stacks retain a subscribe session that no longer receives beacons. */
   private void checkAwareDiscovery() {
     if (
-      closed || host || strongWinner() || awarePeerSeen || session == null
+      closed || host || !wants("Aware") || awarePeerSeen || session == null
     ) return;
     restartAware(awareGeneration, "Aware discovery retrying");
   }
 
   private void scheduleAwareRetry() {
     handler.removeCallbacks(retryAware);
-    if (!closed && !strongWinner()) handler.postDelayed(retryAware, 3000);
+    if (!closed && wants("Aware")) handler.postDelayed(retryAware, 3000);
   }
 
   private void sendAwareMessage(PeerHandle peer, String value, int generation) {
@@ -766,7 +1068,9 @@ public final class Nearby implements AutoCloseable {
                 )
               );
             } catch (Exception error) {
-              try { socket.close(); } catch (Exception ignored) {}
+              try {
+                socket.close();
+              } catch (Exception ignored) {}
               value.close();
               awareFailed(peer, value, generation);
             }
@@ -809,8 +1113,7 @@ public final class Nearby implements AutoCloseable {
   }
 
   private void deliver(ConnectionCandidate candidate) {
-    if (closed || (!host && winner != null &&
-        (strongWinner() || "BLE".equals(candidate.transport())))) {
+    if (!wants(candidate.transport())) {
       candidate.close();
       return;
     }
@@ -819,8 +1122,13 @@ public final class Nearby implements AutoCloseable {
   }
 
   private synchronized boolean accept(ConnectionCandidate candidate) {
-    if (closed || (!host && winner != null && winner != candidate &&
-        (strongWinner() || "BLE".equals(candidate.transport())))) return false;
+    if (
+      closed ||
+      (!host &&
+        winner != null &&
+        winner != candidate &&
+        (strongWinner() || "BLE".equals(candidate.transport())))
+    ) return false;
     if (!host) winner = candidate;
     handler.post(() -> finishAccepted(candidate));
     return true;
@@ -828,26 +1136,42 @@ public final class Nearby implements AutoCloseable {
 
   private void finishAccepted(ConnectionCandidate candidate) {
     if (closed) return;
+    if (candidate.endpoint != null) history.success(
+      history.observe(
+        candidate.endpoint.candidateKey(),
+        candidate.endpoint.source,
+        SystemClock.elapsedRealtime()
+      ),
+      SystemClock.elapsedRealtime()
+    );
+    diagnostics.event("AUTH_SUCCESS", candidate.endpoint, 0, "");
     if (host) {
       candidates.remove(candidate);
       return;
     }
     if (winner != candidate) return;
+    if ("LAN".equals(candidate.transport())) {
+      cancelLanAttempts();
+    }
     if (!"BLE".equals(candidate.transport())) {
       handler.removeCallbacks(startBle);
       if (ble != null) ble.suspend();
     }
     for (ConnectionCandidate other : new ArrayList<>(candidates))
-      if (other != candidate) other.close();
+      if (
+        other != candidate && other != backup && !wants(other.transport())
+      ) other.close();
     lanState = "LAN".equals(candidate.transport()) ? "connected" : "cancelled";
     if ("LAN".equals(candidate.transport())) {
       // Keep the Aware discovery session alive as a warm fallback. A route
       // change can then reuse its peer handle instead of waiting to attach and
       // discover again.
       awareState = "standby";
-      messages.clear();
-      for (AwareDataPath path : paths.values()) path.close();
-      paths.clear();
+      if (!"Auto".equals(preference)) {
+        messages.clear();
+        for (AwareDataPath path : paths.values()) path.close();
+        paths.clear();
+      }
     } else if ("Aware".equals(candidate.transport())) {
       awareState = "connected";
       for (
@@ -875,8 +1199,16 @@ public final class Nearby implements AutoCloseable {
       winner = null;
       pairedBleActive = false;
       if (previous != null) previous.close();
+      lanRetries.clear();
+      authenticationRetries.clear();
+      // Discovery may stay quiet after a socket failure. Retry cached endpoints now.
+      handler.post(this::onTopologyChanged);
       lanState = "reconnecting";
-      if (!"Aware".equals(preference) && !"BLE".equals(preference) && browser == null) startLan();
+      if (
+        !"Aware".equals(preference) &&
+        !"BLE".equals(preference) &&
+        browser == null
+      ) startLan();
       scheduleBle();
       if (!"LAN".equals(preference) && !"BLE".equals(preference)) {
         // A failed Aware socket invalidates its data path and peer state on
@@ -888,8 +1220,7 @@ public final class Nearby implements AutoCloseable {
         ) {
           closeAware();
           startAware();
-        }
-        else {
+        } else {
           awareState = "reconnecting";
           for (PeerHandle peer : new ArrayList<>(knownAwarePeers))
             sendAwareMessage(peer, invite.jamId, awareGeneration);
@@ -907,18 +1238,33 @@ public final class Nearby implements AutoCloseable {
     LanEndpoint endpoint = candidate.endpoint;
     handler.post(() -> {
       if (endpoint == null) {
-        if (candidate.path != null)
-          for (Map.Entry<PeerHandle, AwareDataPath> entry : paths.entrySet())
-            if (entry.getValue() == candidate.path) {
-              awareFailed(entry.getKey(), candidate.path, candidate.generation());
-              break;
-            }
+        if (candidate.path != null) for (Map.Entry<
+          PeerHandle,
+          AwareDataPath
+        > entry : paths.entrySet())
+          if (entry.getValue() == candidate.path) {
+            awareFailed(entry.getKey(), candidate.path, candidate.generation());
+            break;
+          }
         return;
       }
-      if (closed || strongWinner() ||
-          endpoints.get(endpoint.fingerprint) != endpoint) return;
-      int count = authenticationRetries.getOrDefault(endpoint.fingerprint, 0) + 1;
-      authenticationRetries.put(endpoint.fingerprint, count);
+      if (
+        closed ||
+        !wants("LAN") ||
+        endpoints.get(endpoint.candidateKey()) != endpoint
+      ) return;
+      int count =
+        authenticationRetries.getOrDefault(endpoint.candidateKey(), 0) + 1;
+      authenticationRetries.put(endpoint.candidateKey(), count);
+      history.failure(
+        history.observe(
+          endpoint.candidateKey(),
+          endpoint.source,
+          SystemClock.elapsedRealtime()
+        ),
+        "AUTH_FAILED"
+      );
+      diagnostics.event("AUTH_FAILED", endpoint, 0, "AUTH_FAILED");
       if (count <= 3) handler.postDelayed(
         () -> connectLan(endpoint),
         count * 700L
@@ -928,6 +1274,27 @@ public final class Nearby implements AutoCloseable {
 
   private void forget(ConnectionCandidate candidate) {
     candidates.remove(candidate);
+    if (backup == candidate) {
+      backup = null;
+      handler.post(() -> {
+        if (closed) return;
+        if ("Aware".equals(candidate.transport()) && wants("Aware")) {
+          closeAware();
+          startAware();
+        } else handler.post(this::onTopologyChanged);
+      });
+    }
+    if (candidate.endpoint != null) handler.post(() -> {
+      LanEndpoint endpoint = candidate.endpoint;
+      lanConnecting.remove(endpoint.candidateKey());
+      history.release(
+        history.observe(
+          endpoint.candidateKey(),
+          endpoint.source,
+          SystemClock.elapsedRealtime()
+        )
+      );
+    });
   }
 
   private void closeAware() {
@@ -967,6 +1334,8 @@ public final class Nearby implements AutoCloseable {
       advertiser = null;
       if (browser != null) browser.close();
       browser = null;
+      if (localDiscovery != null) localDiscovery.close();
+      localDiscovery = null;
       if (awareReceiver != null) try {
         context.unregisterReceiver(awareReceiver);
       } catch (RuntimeException ignored) {}
@@ -974,6 +1343,7 @@ public final class Nearby implements AutoCloseable {
       closeAware();
       for (ConnectionCandidate candidate : new ArrayList<>(candidates))
         candidate.close();
+      cancelLanAttempts();
       workers.shutdownNow();
     });
   }

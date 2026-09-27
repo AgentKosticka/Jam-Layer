@@ -17,6 +17,45 @@ final class LanEndpoint {
   final List<InetAddress> addresses;
   final int port;
   final Map<String, byte[]> attributes;
+  final DiscoverySource source;
+
+  String candidateKey() {
+    byte[] jam = attributes.get("jam");
+    return ConnectionCandidateManager.key(
+      jam == null
+        ? ""
+        : new String(jam, java.nio.charset.StandardCharsets.UTF_8),
+      networkHandle,
+      addresses.get(0),
+      port
+    );
+  }
+
+  LanEndpoint single(Network route, InetAddress address) {
+    return new LanEndpoint(
+      serviceName,
+      serviceType,
+      route,
+      discoveryHandle,
+      Collections.singletonList(address),
+      port,
+      attributes,
+      source
+    );
+  }
+
+  LanEndpoint withSource(DiscoverySource source) {
+    return new LanEndpoint(
+      serviceName,
+      serviceType,
+      network,
+      discoveryHandle,
+      addresses,
+      port,
+      attributes,
+      source
+    );
+  }
 
   LanEndpoint(
     String serviceName,
@@ -33,7 +72,8 @@ final class LanEndpoint {
       network == null ? -1 : network.getNetworkHandle(),
       addresses,
       port,
-      attributes
+      attributes,
+      DiscoverySource.NSD
     );
   }
 
@@ -46,6 +86,29 @@ final class LanEndpoint {
     int port,
     Map<String, byte[]> attributes
   ) {
+    this(
+      serviceName,
+      serviceType,
+      network,
+      discoveryHandle,
+      addresses,
+      port,
+      attributes,
+      DiscoverySource.NSD
+    );
+  }
+
+  private LanEndpoint(
+    String serviceName,
+    String serviceType,
+    Network network,
+    long discoveryHandle,
+    List<InetAddress> addresses,
+    int port,
+    Map<String, byte[]> attributes,
+    DiscoverySource source
+  ) {
+    this.source = source;
     this.serviceName = serviceName == null ? "" : serviceName;
     this.serviceType = serviceType == null ? "" : serviceType;
     this.network = network;
@@ -78,7 +141,7 @@ final class LanEndpoint {
       info.getHost() == null
         ? Collections.emptyList()
         : Collections.singletonList(info.getHost());
-    return new LanEndpoint(
+    LanEndpoint endpoint = new LanEndpoint(
       info.getServiceName(),
       info.getServiceType(),
       network,
@@ -86,6 +149,11 @@ final class LanEndpoint {
       addresses,
       info.getPort(),
       info.getAttributes()
+    );
+    return endpoint.withSource(
+      knownNetwork == null
+        ? DiscoverySource.NSD
+        : DiscoverySource.NSD_NETWORK_SCOPED
     );
   }
 

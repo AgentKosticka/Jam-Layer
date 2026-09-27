@@ -25,6 +25,11 @@ public final class DeviceScenario extends Instrumentation {
     @Override public void onStart(){
         Bundle result=new Bundle();
         try{
+            if (args.getString("role", "").startsWith("lanSocket")) {
+                LanSocketScenario.run(this, args);
+                result.putString("stream", "LAN_SOCKET_OK\n");
+                finish(Activity.RESULT_OK, result); return;
+            }
             if (args.getString("role", "").startsWith("layer")) {
                 LayerScenario.run(this, args);
                 result.putString("stream", "LAYER_OK\n");
@@ -43,10 +48,7 @@ public final class DeviceScenario extends Instrumentation {
                 finish(Activity.RESULT_OK, result);
                 return;
             }
-            Context context=getTargetContext();context.startActivity(new Intent(context,MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-            Thread.sleep(1200);context.startForegroundService(JamService.startIntent(context));
-            for(int i=0;i<50&&JamService.active==null;i++)Thread.sleep(100);
-            JamService s=JamService.active;check(s!=null,"Service unavailable");String mode=args.getString("transport","LAN");
+            Context context=getTargetContext();String mode=args.getString("transport","LAN");
             if("blePolicy".equals(args.getString("role"))){
                 java.util.concurrent.atomic.AtomicBoolean blocked=new java.util.concurrent.atomic.AtomicBoolean(true);
                 java.util.concurrent.atomic.AtomicReference<String> status=new java.util.concurrent.atomic.AtomicReference<>("");
@@ -69,6 +71,10 @@ public final class DeviceScenario extends Instrumentation {
                 }finally{radio.close();}
                 finish(Activity.RESULT_OK,result);return;
             }
+            context.startActivity(new Intent(context,MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            Thread.sleep(1200);context.startForegroundService(JamService.startIntent(context));
+            for(int i=0;i<50&&JamService.active==null;i++)Thread.sleep(100);
+            JamService s=JamService.active;check(s!=null,"Service unavailable");
             if("bridge".equals(args.getString("role"))){
                 java.lang.reflect.Field field=JamService.class.getDeclaredField("bridge");field.setAccessible(true);
                 for(int i=0;i<50&&field.get(s)==null;i++)Thread.sleep(100);
