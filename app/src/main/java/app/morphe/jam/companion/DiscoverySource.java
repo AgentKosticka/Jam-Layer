@@ -1,6 +1,8 @@
 package app.morphe.jam.companion;
 
 enum DiscoverySource {
+  AWARE,
+  BLE,
   INVITE_HINT,
   NSD,
   NSD_NETWORK_SCOPED,

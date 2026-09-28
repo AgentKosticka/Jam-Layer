@@ -48,6 +48,10 @@ Local joins race direct invitation hints, NSD, IPv4 directed broadcast and IPv6
 link-local multicast. A delayed, bounded UDP subnet probe recovers when other
 discovery is filtered. Auto can keep an authenticated LAN/Aware backup and promote
 it when the primary fails. Every candidate still passes SecureChannel authentication.
+Invitations include local IPv4 and IPv6 hints. Network changes can prepare an
+authenticated replacement before the active connection fails. Reconnect ordering
+uses measured latency and recent failures; structured lifecycle states and
+Aware/BLE failure categories are available in local diagnostics.
 Short-code joins also use broadcast, IPv6 multicast and bounded probing, then
 authenticate with PAKE and reuse that connection. Without a shared LAN, keep
 Wi-Fi enabled on both devices for direct Wi-Fi Aware discovery. Aware short-code

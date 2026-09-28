@@ -207,13 +207,16 @@ final class BleNearby implements AutoCloseable {
           if (closed || epoch != generation || connections.size() >= 4) { close(incoming); return; }
           deliver(incoming, epoch);
         });
-      } catch (Exception error) { break; }
+      } catch (Exception error) {
+        handler.post(() -> failed(epoch, "L2CAP accept unavailable"));
+        break;
+      }
     }
   }
 
   private void scan() {
     scanner = adapter.getBluetoothLeScanner();
-    if (scanner == null) { state("scanning unavailable"); return; }
+    if (scanner == null) { failed(generation, "scanning unavailable"); return; }
     int epoch = generation;
     scanning = new ScanCallback() {
       public void onScanResult(int type, ScanResult result) {
@@ -270,13 +273,15 @@ final class BleNearby implements AutoCloseable {
       connections.add(connection);
       state("socket connected");
       listener.connected(connection);
-    } catch (Exception error) { close(socket); }
+    } catch (Exception error) { close(socket); failed(epoch, "L2CAP framing unavailable"); }
   }
 
   private void failed(int epoch, String reason) {
     if (closed || epoch != generation) return;
     stopRadio();
-    retryAt = SystemClock.elapsedRealtime() + 10000;
+    TransportFailure failure = TransportFailure.ble(reason);
+    retryAt = SystemClock.elapsedRealtime() + Math.max(10000,
+      failure == null ? 10000 : failure.retryDelay(1));
     state(reason);
   }
 
@@ -301,7 +306,13 @@ final class BleNearby implements AutoCloseable {
   }
 
   private void state(String state) {
-    if (!state.equals(lastState)) { lastState = state; listener.state(state); }
+    if (!state.equals(lastState)) {
+      lastState = state;
+      TransportFailure failure = TransportFailure.ble(state);
+      android.util.Log.i("MorpheJam", "BLE state=" + state + " failureClass=" +
+        (failure == null ? "" : failure.name()));
+      listener.state(state);
+    }
   }
 
   private static void close(AutoCloseable value) {

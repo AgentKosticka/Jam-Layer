@@ -38,6 +38,13 @@ final class AwareDataPath implements AutoCloseable {
   private ConnectivityManager.NetworkCallback callback;
   private State state = State.NEW;
   private boolean socketStarted, closed;
+  private Socket connectingSocket;
+  private final Runnable peerInfoTimeout = () -> {
+    synchronized (AwareDataPath.this) {
+      if (closed || socketStarted) return;
+    }
+    fail("peer-info", new IOException("Aware peer information unavailable"));
+  };
 
   AwareDataPath(
     ConnectivityManager connectivity,
@@ -88,6 +95,7 @@ final class AwareDataPath implements AutoCloseable {
           state = State.AVAILABLE;
         }
         listener.onPathAvailable(AwareDataPath.this);
+        if (connectSocket) handler.postDelayed(peerInfoTimeout, 15000);
       }
 
       @Override
@@ -108,6 +116,7 @@ final class AwareDataPath implements AutoCloseable {
           socketStarted = true;
           state = State.PEER_INFO_READY;
         }
+        handler.removeCallbacks(peerInfoTimeout);
         workers.execute(() -> connect(network, info));
       }
 
@@ -146,6 +155,10 @@ final class AwareDataPath implements AutoCloseable {
       }
       int port = remotePort > 0 ? remotePort : info.getPort();
       socket = network.getSocketFactory().createSocket();
+      synchronized (this) {
+        if (closed) { socket.close(); return; }
+        connectingSocket = socket;
+      }
       socket.connect(
         new InetSocketAddress(info.getPeerIpv6Addr(), port),
         timeoutMillis
@@ -158,6 +171,7 @@ final class AwareDataPath implements AutoCloseable {
         state = State.CONNECTED;
       }
       listener.onSocket(this, socket);
+      synchronized (this) { connectingSocket = null; }
     } catch (Exception error) {
       try {
         if (socket != null) socket.close();
@@ -194,13 +208,18 @@ final class AwareDataPath implements AutoCloseable {
   @Override
   public void close() {
     ConnectivityManager.NetworkCallback value;
+    Socket pending;
     synchronized (this) {
       if (closed) return;
       closed = true;
       state = State.CLOSED;
       value = callback;
       callback = null;
+      pending = connectingSocket;
+      connectingSocket = null;
     }
+    handler.removeCallbacks(peerInfoTimeout);
+    if (pending != null) try { pending.close(); } catch (IOException ignored) {}
     if (value != null) try {
       connectivity.unregisterNetworkCallback(value);
     } catch (RuntimeException ignored) {}

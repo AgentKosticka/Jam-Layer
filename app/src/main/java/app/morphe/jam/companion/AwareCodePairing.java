@@ -54,6 +54,7 @@ final class AwareCodePairing implements AutoCloseable {
   private final Map<Integer, PendingMessage> messages = new HashMap<>();
   private final WifiAwareManager manager;
   private final Runnable retryAware = this::attach;
+  private final TransportDiagnostics diagnostics = new TransportDiagnostics();
   private final boolean host;
   private final String code, jam;
   private final int port;
@@ -136,6 +137,7 @@ final class AwareCodePairing implements AutoCloseable {
       manager == null
     ) return;
     if (!manager.isAvailable()) {
+      diagnostics.event("AWARE_UNAVAILABLE", null, 0, TransportFailure.AWARE_UNAVAILABLE.name());
       retryAttach();
       return;
     }
@@ -147,6 +149,7 @@ final class AwareCodePairing implements AutoCloseable {
           @Override
           public void onAttachFailed() {
             if (!active(expected)) return;
+            diagnostics.event("AWARE_ATTACH_FAILED", null, 0, TransportFailure.AWARE_ATTACH_FAILED.name());
             attaching = false;
             android.util.Log.w("MorpheJam", "Aware code attach failed");
             retryAttach();
@@ -191,12 +194,15 @@ final class AwareCodePairing implements AutoCloseable {
 
               @Override
               public void onSessionConfigFailed() {
+                diagnostics.event("AWARE_DISCOVERY_FAILED", null, 0, TransportFailure.AWARE_DISCOVERY_STALLED.name());
                 android.util.Log.w("MorpheJam", "Aware code session config failed");
                 restart(expected);
               }
 
               @Override
               public void onSessionTerminated() {
+                if (!active(expected)) return;
+                diagnostics.event("AWARE_DISCOVERY_ENDED", null, 0, TransportFailure.AWARE_DISCOVERY_STALLED.name());
                 android.util.Log.w("MorpheJam", "Aware code session terminated");
                 restart(expected);
               }
@@ -478,6 +484,7 @@ final class AwareCodePairing implements AutoCloseable {
                 handedOff = true;
               } else handoff.close();
             } catch (Exception error) {
+              diagnostics.event("AWARE_CODE_AUTH_FAILED", null, 0, TransportFailure.AUTH_FAILED.name());
               failedPath(peer, candidate, expected, value);
               return;
             } finally {
@@ -497,6 +504,8 @@ final class AwareCodePairing implements AutoCloseable {
             Exception error
           ) {
             android.util.Log.w("MorpheJam", "Aware code path failed " + phase);
+            diagnostics.event("AWARE_PATH_FAILED", null, 0,
+              ("socket".equals(phase) ? TransportFailure.AWARE_SOCKET_FAILED : TransportFailure.AWARE_PATH_FAILED).name());
             handler.post(() -> failedPath(peer, candidate, expected, value));
           }
         }
@@ -577,7 +586,7 @@ final class AwareCodePairing implements AutoCloseable {
       if (host) {
         if (path(peer, null, 0, expected)) send(peer, READY + jam + ":" + port);
       } else if (candidate != null) send(peer, REQUEST + candidate.jam);
-    }, attempt * 500L);
+    }, TransportFailure.AWARE_PATH_FAILED.retryDelay(attempt));
   }
 
   private void closeResources() {

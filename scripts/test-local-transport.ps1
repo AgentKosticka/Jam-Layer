@@ -9,11 +9,14 @@ param(
     [switch]$WarmBackup,
     [int]$HoldBackupMs = 0,
     [switch]$DeadCandidate,
-    [switch]$ShortCode
+    [switch]$ShortCode,
+    [switch]$Ipv6Hints,
+    [switch]$Replacement
 )
 $ErrorActionPreference = 'Stop'
 $devices = @(& adb devices | ForEach-Object { if ($_ -match '^(\S+)\s+device$') { $Matches[1] } })
-if ($devices.Count -ne 2 -or $HostSerial -eq $GuestSerial -or $HostSerial -notin $devices -or $GuestSerial -notin $devices) {
+$physical = @($devices | ForEach-Object { (& adb -s $_ shell getprop ro.serialno).Trim() } | Sort-Object -Unique)
+if ($physical.Count -ne 2 -or $HostSerial -eq $GuestSerial -or $HostSerial -notin $devices -or $GuestSerial -notin $devices) {
     throw 'Exactly two usable devices matching HostSerial and GuestSerial are required.'
 }
 $root = Split-Path -Parent $PSScriptRoot
@@ -21,6 +24,8 @@ $output = Join-Path $root "build/transport-results/$Label"
 New-Item -ItemType Directory -Force $output | Out-Null
 $runner = 'app.morphe.jam.companion.test/app.morphe.jam.companion.DeviceScenario'
 $options = @()
+if ($Ipv6Hints) { $options += @('-e', 'ipv6Hints', 'true') }
+if ($Replacement) { $options += @('-e', 'replacement', 'true') }
 if ($WarmBackup) { $options += @('-e', 'warmBackup', 'true') }
 if ($HoldBackupMs) { $options += @('-e', 'holdBackupMs', "$HoldBackupMs") }
 $sources = @{ InviteHints = 'INVITE_HINT'; Ipv4Broadcast = 'IPV4_BROADCAST'; Ipv6Multicast = 'IPV6_MULTICAST'; ActiveProbe = 'ACTIVE_PROBE' }

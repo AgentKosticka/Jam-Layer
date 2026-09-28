@@ -7,6 +7,18 @@ import java.util.*;
 import org.junit.Test;
 
 public class InvitationTest {
+  @org.junit.Test public void hintsRetainBothFamiliesAndStripSenderScope() throws Exception {
+    Invitation invite = new Invitation();
+    java.util.List<Invitation.Hint> hints = new java.util.ArrayList<>();
+    for (int i = 1; i <= 5; i++) hints.add(new Invitation.Hint(java.net.InetAddress.getByName("10.0.0." + i), 1234));
+    hints.add(new Invitation.Hint(java.net.Inet6Address.getByAddress(null,
+      java.net.InetAddress.getByName("fe80::1234").getAddress(), 77), 1234));
+    invite.setHints(hints);
+    Invitation parsed = new Invitation(invite.uri());
+    org.junit.Assert.assertEquals(4, parsed.hints.size());
+    java.net.Inet6Address ipv6 = (java.net.Inet6Address) parsed.hints.get(1).address;
+    org.junit.Assert.assertEquals(0, ipv6.getScopeId());
+  }
 
   @Test
   public void v1AndV2RoundTripAndStaleHintsRemainAdvisory() throws Exception {

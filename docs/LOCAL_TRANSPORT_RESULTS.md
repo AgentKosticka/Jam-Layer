@@ -1,4 +1,19 @@
-# Local transport results — 2026-09-27
+# Local transport results
+
+## 2026-09-28 remaining workstreams
+
+51 unit tests and both APK builds pass. IPv6-only invitation joins passed in both
+orientations (259/159 ms). Authenticated replacement preparation preserved the
+healthy primary and promoted after forced failure in 72 ms in both orientations.
+Auto warm-backup promotion passed in 111 ms after a 35-second keepalive hold;
+reverse short-code backup promotion passed in 45 ms. PING telemetry measured both
+primary LAN and backup Aware. Both devices passed the injected BLE audio guard.
+
+Initial Aware radio-path failures required a diagnostic Wi-Fi reset before later
+checks passed; failed attempts remain in the raw evidence. See the dated section
+of [TRANSPORT_TEST_MATRIX.md](TRANSPORT_TEST_MATRIX.md) for exact test scope and
+limitations. Topology replacement was replayed over real interfaces, not actual
+AP roaming. Pairing settings were preserved for restoration after testing.
 
 ## QR/code follow-up
 

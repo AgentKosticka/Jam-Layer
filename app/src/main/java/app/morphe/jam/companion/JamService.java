@@ -180,7 +180,12 @@ public final class JamService extends Service {
       TimeUnit.MILLISECONDS
     );
     monitor.scheduleWithFixedDelay(
-      () -> workers.execute(this::pingBackup),
+      () -> workers.execute(() -> {
+        pingBackup();
+        if ("Participant".equals(role) && channel != null) try {
+          dispatch(new JSONObject().put("op", "PING"));
+        } catch (Exception ignored) {}
+      }),
       30,
       30,
       TimeUnit.SECONDS
@@ -206,11 +211,14 @@ public final class JamService extends Service {
       WarmChannel standby = backupChannel;
       if (standby == null) return;
       try {
+        long started = SystemClock.elapsedRealtime();
         standby.channel.setReadTimeout(2000);
         standby.channel.send(new JSONObject().put("op", "PING").toString());
         if (
           !new JSONObject(standby.channel.receive()).optBoolean("ok")
         ) throw new IOException("Backup ping failed");
+        Nearby current = nearby;
+        if (current != null) current.recordRtt(standby.candidate, SystemClock.elapsedRealtime() - started);
       } catch (Exception error) {
         if (backupChannel == standby) backupChannel = null;
         standby.candidate.close();
@@ -342,6 +350,7 @@ public final class JamService extends Service {
   public JSONObject state() {
     try {
       return ok()
+        .put("transportLifecycle", nearby == null ? new JSONObject().put("session", "IDLE") : nearby.lifecycle.snapshot())
         .put("role", role)
         .put("transport", transport)
         .put(
@@ -1125,6 +1134,9 @@ public final class JamService extends Service {
         long sent = SystemClock.elapsedRealtime();
         activeChannel.send(request.toString());
         JSONObject value = new JSONObject(activeChannel.receive());
+        Nearby currentNearby = nearby;
+        if (currentNearby != null && "PING".equals(request.optString("op")))
+          currentNearby.recordRtt(null, SystemClock.elapsedRealtime() - sent);
         JSONObject clock = value.optJSONObject("clock");
         if (clock != null) clock
           .put("receivedAt", SystemClock.elapsedRealtime())
@@ -1150,6 +1162,8 @@ public final class JamService extends Service {
         }
         return value;
       } catch (Exception e) {
+        Nearby currentNearby = nearby;
+        if (currentNearby != null) currentNearby.primaryFailed();
         try {
           activeChannel.close();
         } catch (Exception ignored) {}

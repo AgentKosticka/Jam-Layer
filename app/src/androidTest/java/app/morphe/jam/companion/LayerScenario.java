@@ -193,9 +193,19 @@ final class LayerScenario {
         await(() -> Files.exists(stop), 150000, "Guest did not finish");
       } else if ("layerGuest".equals(role)) {
         long started = SystemClock.elapsedRealtime();
+        String joinInvite = args.getString("invite");
+        if ("true".equals(args.getString("ipv6Hints"))) {
+          Invitation onlyV6 = new Invitation(joinInvite);
+          java.util.List<Invitation.Hint> hints = new java.util.ArrayList<>();
+          for (Invitation.Hint hint : onlyV6.hints)
+            if (hint.address instanceof java.net.Inet6Address) hints.add(hint);
+          check(!hints.isEmpty(), "Host did not advertise IPv6 hints");
+          onlyV6.setHints(hints);
+          joinInvite = onlyV6.uri();
+        }
         JSONObject joined = service.dispatch(
           command("JOIN")
-            .put("invite", args.getString("invite"))
+            .put("invite", joinInvite)
             .put("transport", mode)
         );
         check(
@@ -212,6 +222,8 @@ final class LayerScenario {
         );
         long connected = SystemClock.elapsedRealtime() - started;
         Nearby nearby = (Nearby) field("nearby").get(service);
+        await(() -> nearby.lifecycle.session() == TransportLifecycle.Session.CONNECTED, 2000,
+          "Authenticated session lifecycle is not connected");
         String timeline = nearby.diagnostics.snapshot().toString();
         String expectedSource = args.getString("expectedSource", "");
         if (!expectedSource.isEmpty()) {
@@ -252,7 +264,21 @@ final class LayerScenario {
           "Host state did not converge"
         );
         SecureChannel previous = (SecureChannel) field("channel").get(service);
-        boolean warm = "true".equals(args.getString("warmBackup"));
+        boolean replacement = "true".equals(args.getString("replacement"));
+        boolean warm = replacement || "true".equals(args.getString("warmBackup"));
+        if (replacement) {
+          // Replays a material topology notification using the real interfaces.
+          // Both IPv4 and IPv6 remain available; the primary must survive discovery.
+          Field sf = Nearby.class.getDeclaredField("snapshot"); sf.setAccessible(true);
+          LocalNetworkTracker.Snapshot old = (LocalNetworkTracker.Snapshot) sf.get(nearby);
+          sf.set(nearby, new LocalNetworkTracker.Snapshot(old.localNetworks, old.vpnActive,
+            old.defaultNetwork, old.generation + 1));
+          java.lang.reflect.Method refresh = Nearby.class.getDeclaredMethod("onTopologyChanged");
+          refresh.setAccessible(true);
+          test.runOnMainSync(() -> {
+            try { refresh.invoke(nearby); } catch (Exception e) { throw new IllegalStateException(e); }
+          });
+        }
         String originalTransport = service.state().optString("transport");
         if (warm) {
           await(
@@ -264,11 +290,12 @@ final class LayerScenario {
             "Authenticated backup unavailable"
           );
           check(
-            !originalTransport.equals(
+            replacement || !originalTransport.equals(
               service.state().optString("backupTransport")
             ),
             "Backup must be a distinct transport"
           );
+          check(field("channel").get(service) == previous, "Preparing backup replaced healthy primary");
           synchronized (field("backupLock").get(service)) {
             Object backup = field("backupChannel").get(service);
             Field secure = backup.getClass().getDeclaredField("channel");
@@ -310,7 +337,7 @@ final class LayerScenario {
         );
         if (warm) {
           check(
-            !originalTransport.equals(service.state().optString("transport")),
+            replacement || !originalTransport.equals(service.state().optString("transport")),
             "Backup was not promoted"
           );
           check(

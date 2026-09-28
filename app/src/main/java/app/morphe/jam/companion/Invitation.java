@@ -65,6 +65,14 @@ public final class Invitation {
     TreeMap<String, Hint> unique = new TreeMap<>();
     for (Hint hint : values) unique.put(hint.encode(), hint);
     ArrayList<Hint> bounded = new ArrayList<>(unique.values());
+    // Alternate families so several IPv4 interfaces cannot crowd IPv6 out of the QR.
+    List<Hint> v4 = new ArrayList<>(), v6 = new ArrayList<>();
+    for (Hint hint : bounded) (hint.address.getAddress().length == 4 ? v4 : v6).add(hint);
+    bounded.clear();
+    for (int i = 0; i < Math.max(v4.size(), v6.size()); i++) {
+      if (i < v4.size()) bounded.add(v4.get(i));
+      if (i < v6.size()) bounded.add(v6.get(i));
+    }
     hints = Collections.unmodifiableList(
       bounded.subList(0, Math.min(MAX_HINTS, bounded.size()))
     );

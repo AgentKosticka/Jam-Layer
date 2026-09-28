@@ -6,6 +6,21 @@ import java.net.*;
 import org.junit.Test;
 
 public class ConnectionCandidateManagerTest {
+  @Test public void unstablePathsRemainPenalizedAfterReconnectAndRecoverWithTime() {
+    ConnectionCandidateManager m = new ConnectionCandidateManager();
+    ConnectionCandidateManager.Record r = m.observe("path", DiscoverySource.NSD, 1);
+    m.begin(r, 2); m.authenticating(r, 3); m.success(r, 4);
+    m.success(r, 30000);
+    assertEquals(1, r.lastAuthDurationMs);
+    m.rtt("path", 100, 5); m.rtt("path", 20, 6);
+    assertEquals(80, r.rttMs);
+    long healthy = m.score("path", 6);
+    m.disconnected("path", 7); m.success(r, 8);
+    assertTrue(m.score("path", 8) > healthy);
+    m.rtt("path", 20, 60008);
+    assertEquals(0, r.disconnects);
+    assertTrue(m.score("path", 60008) < healthy + 1500);
+  }
 
   @Test
   public void provenanceSharesOneReservationThroughAuthentication()

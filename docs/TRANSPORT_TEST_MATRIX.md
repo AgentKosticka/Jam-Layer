@@ -1,5 +1,42 @@
 # Transport acceptance matrix
 
+## 2026-09-28 remaining workstream checks
+
+Implemented RTT/disconnect/age scoring, proactive authenticated LAN replacement,
+explicit provider/session lifecycle states, expanded Aware/BLE failures and bounded
+retry policy, and host IPv6 invitation hints with guest interface scoping.
+
+51 unit tests pass. New checks cover family-balanced hint bounds and removal of
+sender IPv6 scope, smoothed RTT and instability penalties, preserving authentication
+duration during promotion, terminal lifecycle transitions, and audio/permission
+retry exclusions. App and instrumentation APKs assemble.
+
+Both physical devices passed IPv6-only invitation joins with other discovery
+disabled (259/159 ms joins, 2053/952 ms reconnects). Proactive replacement tests
+replayed a material topology notification over the actual IPv4/IPv6 interfaces:
+the existing primary remained unchanged while a second LAN channel authenticated,
+backup mutation was refused, then forced primary failure promoted the replacement
+and retained canonical state. Both orientations recovered in 72 ms.
+
+Initial Aware request/socket failures persisted across application discovery
+reattaches. A diagnostic Wi-Fi off/on cycle cleared the device radio state; the
+user rejoined the tablet to Wi-Fi. Thereafter forced Aware joined/recovered in
+9083/3913 ms; Auto with a 35-second backup hold passed (1598 ms join, 111 ms
+promotion), and reverse short-code Auto passed (766 ms join, 45 ms promotion).
+The hold recorded actual PING RTT samples for both Aware (10 ms) and primary LAN
+(53 ms). Both devices passed the injected BLE audio-policy check.
+
+Failures are retained under `remaining-backup`, `remaining-code-backup`,
+`remaining-backup-coordinated`, and `remaining-aware-reattach`; the later successful
+checks have separate labels. This does not claim that the app can repair every
+vendor radio failure without user intervention. No actual AP roaming, VPN transition,
+or headphone audio-quality test was performed. The normal app never toggles Wi-Fi.
+User pairing was saved before device fixtures and restored afterward.
+
+The final minor history/resource-cleanup changes received unit/build checks and
+an additional `remaining-installed-replacement` device run. Other measurements
+above precede those two isolated corrections.
+
 Run each case on two physical devices without restarting either app between
 iterations.
 
